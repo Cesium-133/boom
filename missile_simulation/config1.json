@@ -1,0 +1,48 @@
+{
+  "simulation": {
+    "duration": 100,
+    "time_step": 0.5
+  },
+  "constants": {
+    "g": 9.8,
+    "missile_speed": 300,
+    "smoke_cloud_radius": 10,
+    "smoke_cloud_sink_speed": 3
+  },
+  "targets": {
+    "fake_target": [0, 0, 0],
+    "true_target": {
+      "base_center": [0, 200, 0],
+      "radius": 7,
+      "height": 10
+    }
+  },
+  "missiles": {
+    "M1": {
+      "initial_pos": [20000, 0, 2000]
+    }
+  },
+  "uavs": {
+    "FY1": {
+      "initial_pos": [17800, 0, 1800],
+      "flight_plan": {
+        "velocity": 120,
+        "direction": [-1, 0, 0],
+        "deployments": [
+          {
+            "deploy_time": 1.5,
+            "fuse_time": 3.6
+          }
+        ]
+      }
+    }
+  },
+  "rendering": {
+    "use_cylinder_mesh": true,
+    "use_cloud_mesh": true,
+    "cylinder_slices": 36,
+    "sphere_rings": 8,
+    "sphere_sectors": 16
+  }
+}
+
