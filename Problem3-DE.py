@@ -33,11 +33,12 @@ import copy
 # 导入求解器
 from solver import (
     calculate_single_uav_triple_smoke_masking,
+    calculate_single_uav_triple_smoke_masking_multiple,
     TARGETS, MISSILES, SMOKE_PARAMS
 )
 from solver.trajectory import TrajectoryCalculator
 
-HAS_MULTIPLE_MASKING = False
+HAS_MULTIPLE_MASKING = True
 
 # 配置matplotlib中文显示
 plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'DejaVu Sans']
@@ -110,7 +111,7 @@ def evaluate_individual_fitness_multiple(individual_data):
             'smoke_c_explode_delay': position[7]    # 烟幕弹C引信延时
         }
         
-        # 计算适应度 - 使用联合遮蔽模式 + 自适应步长算法
+        # 计算适应度 - 使用联合遮蔽模式
         duration = calculate_single_uav_triple_smoke_masking_multiple(
             uav_direction=params['theta_FY1'],
             uav_speed=params['v_FY1'],
@@ -119,8 +120,7 @@ def evaluate_individual_fitness_multiple(individual_data):
             smoke_b_deploy_delay=params['smoke_b_deploy_delay'],
             smoke_b_explode_delay=params['smoke_b_explode_delay'],
             smoke_c_deploy_delay=params['smoke_c_deploy_delay'],
-            smoke_c_explode_delay=params['smoke_c_explode_delay'],
-            algorithm="adaptive"  # 使用自适应步长算法
+            smoke_c_explode_delay=params['smoke_c_explode_delay']
         )
         
         return duration
@@ -799,8 +799,7 @@ def analyze_problem3_de_results(best_position: np.ndarray, best_fitness: float,
             smoke_b_deploy_delay=best_params['smoke_b_deploy_delay'],
             smoke_b_explode_delay=best_params['smoke_b_explode_delay'],
             smoke_c_deploy_delay=best_params['smoke_c_deploy_delay'],
-            smoke_c_explode_delay=best_params['smoke_c_explode_delay'],
-            algorithm="adaptive"
+            smoke_c_explode_delay=best_params['smoke_c_explode_delay']
         )
     else:
         verification_result = calculate_single_uav_triple_smoke_masking(

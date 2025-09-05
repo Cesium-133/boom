@@ -499,8 +499,7 @@ def calculate_single_uav_triple_smoke_masking_multiple(
     smoke_b_deploy_delay: float,
     smoke_b_explode_delay: float,
     smoke_c_deploy_delay: float,
-    smoke_c_explode_delay: float,
-    algorithm: str = "adaptive"  # "fixed", "adaptive", "smart"
+    smoke_c_explode_delay: float
 ) -> float:
     """
     计算单无人机3烟幕弹单导弹的有效遮蔽时长 - 联合遮挡版本
@@ -518,18 +517,12 @@ def calculate_single_uav_triple_smoke_masking_multiple(
         smoke_b_explode_delay: 烟幕弹B起爆延时（s）
         smoke_c_deploy_delay: 烟幕弹C相对B的投放延时（s）
         smoke_c_explode_delay: 烟幕弹C起爆延时（s）
-        algorithm: 区间查找算法 ("fixed", "adaptive", "smart")
         
     Returns:
         有效遮蔽时长（s）
     """
-    # 导入必要的函数（从 for_merge.py 适配）
-    from .for_merge import (
-        is_cylinder_covered_at_t, 
-        calculate_tangent_plane,
-        compute_tangent_cone_to_sphere,
-        project_point_to_plane
-    )
+    # 导入联合遮挡计算函数
+    from .for_merge import find_full_cover_intervals
     
     # 计算绝对投放时间
     smoke_b_deploy_time = smoke_a_deploy_time + smoke_b_deploy_delay
@@ -548,79 +541,24 @@ def calculate_single_uav_triple_smoke_masking_multiple(
     smoke_b_traj = calc.traj_calc.create_smoke_trajectory(uav_traj, smoke_b_deploy_time, smoke_b_explode_delay)
     smoke_c_traj = calc.traj_calc.create_smoke_trajectory(uav_traj, smoke_c_deploy_time, smoke_c_explode_delay)
     
-    # 创建联合遮蔽判定函数
-    @lru_cache(maxsize=1000)
-    def multiple_smoke_predicate(t: float, threshold: float) -> bool:
-        """
-        联合判定：多个烟幕弹的联合投影是否完全覆盖目标
-        
-        核心思想：
-        1. 将每个烟幕弹建模为一个球体（半径=threshold）
-        2. 从导弹位置向每个球体发射切锥
-        3. 计算所有切锥在目标切平面上的投影
-        4. 判断这些投影的并集是否完全覆盖目标的投影
-        """
-        missile_pos = missile_traj(t)
-        
-        # 获取当前时刻所有活跃的烟幕弹位置
+    # 创建多烟幕弹轨迹函数（返回所有活跃烟幕弹位置）
+    def multi_smoke_trajectory(t: float) -> List[Vector3]:
+        """返回当前时刻所有活跃烟幕弹的位置列表"""
         active_smoke_positions = []
         
         # 检查烟幕弹A是否活跃
         if t >= smoke_a_deploy_time + smoke_a_explode_delay:
-            smoke_a_pos = smoke_a_traj(t)
-            active_smoke_positions.append(smoke_a_pos)
+            active_smoke_positions.append(smoke_a_traj(t))
         
         # 检查烟幕弹B是否活跃
         if t >= smoke_b_deploy_time + smoke_b_explode_delay:
-            smoke_b_pos = smoke_b_traj(t)
-            active_smoke_positions.append(smoke_b_pos)
+            active_smoke_positions.append(smoke_b_traj(t))
         
         # 检查烟幕弹C是否活跃
         if t >= smoke_c_deploy_time + smoke_c_explode_delay:
-            smoke_c_pos = smoke_c_traj(t)
-            active_smoke_positions.append(smoke_c_pos)
+            active_smoke_positions.append(smoke_c_traj(t))
         
-        # 如果没有活跃的烟幕弹，返回False
-        if not active_smoke_positions:
-            return False
-        
-        # 如果只有一个活跃的烟幕弹，回退到原始的单独判定逻辑
-        if len(active_smoke_positions) == 1:
-            smoke_pos = active_smoke_positions[0]
-            top_points = get_top_plane_points(missile_pos, calc.target_centers[1], calc.target_radius)
-            under_points = get_under_points(missile_pos, calc.target_centers[0], calc.target_radius)
-            all_target_points = top_points + under_points
-            
-            target_points_x = np.array([p[0] for p in all_target_points], dtype=np.float64)
-            target_points_y = np.array([p[1] for p in all_target_points], dtype=np.float64)
-            target_points_z = np.array([p[2] for p in all_target_points], dtype=np.float64)
-            
-            max_distance = _compute_max_distance_to_lines_numba(
-                smoke_pos[0], smoke_pos[1], smoke_pos[2],
-                missile_pos[0], missile_pos[1], missile_pos[2],
-                target_points_x, target_points_y, target_points_z
-            )
-            return max_distance <= threshold
-        
-        # 多烟幕弹联合遮挡判定
-        # 使用 for_merge.py 中的逻辑
-        def missile_traj_wrapper(time):
-            return missile_pos  # 在当前时刻，导弹位置固定
-        
-        def smoke_traj_wrapper(time):
-            return active_smoke_positions  # 返回所有活跃烟幕弹位置
-        
-        # 目标几何参数
-        center0 = tuple(calc.target_centers[0])  # 底部中心
-        center1 = tuple(calc.target_centers[1])  # 顶部中心
-        cylinder_radius = calc.target_radius
-        sphere_radius_for_cone = threshold  # 烟幕云半径
-        
-        # 调用联合遮挡判定函数
-        return is_cylinder_covered_at_t(
-            t, missile_traj_wrapper, smoke_traj_wrapper, 
-            center0, center1, cylinder_radius, sphere_radius_for_cone
-        )
+        return active_smoke_positions
     
     # 计算最早起爆时间作为开始时间
     earliest_explode = min(
@@ -629,38 +567,18 @@ def calculate_single_uav_triple_smoke_masking_multiple(
         smoke_c_deploy_time + smoke_c_explode_delay
     )
     
-    # 寻找满足条件的时间区间，使用指定算法
+    # 获取时间边界
     _, end_time = calc.traj_calc.get_trajectory_bounds(missile_traj, calc.max_time)
     
-    if algorithm == "fixed":
-        intervals = find_t_intervals(
-            multiple_smoke_predicate,
-            calc.threshold,
-            earliest_explode,
-            end_time,
-            calc.time_step
-        )
-    elif algorithm == "adaptive":
-        intervals = find_t_intervals_adaptive(
-            multiple_smoke_predicate,
-            calc.threshold,
-            earliest_explode,
-            end_time,
-            initial_step=calc.time_step * 10,
-            min_step=calc.time_step / 2,
-            max_step=calc.time_step * 50
-        )
-    elif algorithm == "smart":
-        intervals = find_t_intervals_smart(
-            multiple_smoke_predicate,
-            calc.threshold,
-            earliest_explode,
-            end_time,
-            initial_step=calc.time_step * 5,
-            aggressive_speedup=True
-        )
-    else:
-        raise ValueError(f"Unknown algorithm: {algorithm}")
+    # 使用 find_full_cover_intervals 计算联合遮挡时间区间
+    intervals = find_full_cover_intervals(
+        traj0_fn=missile_traj,                    # 导弹轨迹
+        traj1_fn=multi_smoke_trajectory,          # 多烟幕弹轨迹
+        t_min=earliest_explode,                   # 开始时间
+        t_max=end_time,                           # 结束时间
+        step=calc.time_step,                      # 时间步长
+        sphere_radius_for_cone=calc.threshold     # 烟幕云半径
+    )
     
     # 计算总遮蔽时长
     total_duration = sum(b - a for a, b in intervals)

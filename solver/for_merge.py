@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from typing import Tuple, Callable, List
-from geometry import find_t_intervals  # reuse interval finder
+from .geometry import find_t_intervals  # reuse interval finder
 import numpy as np
 
 Vector3 = Tuple[float, float, float]
