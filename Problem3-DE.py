@@ -29,6 +29,8 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 import multiprocessing as mp
 from dataclasses import dataclass
 import copy
+from functools import lru_cache
+import threading
 
 # 导入求解器
 from solver import (
@@ -43,6 +45,23 @@ HAS_MULTIPLE_MASKING = True
 # 配置matplotlib中文显示
 plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'DejaVu Sans']
 plt.rcParams['axes.unicode_minus'] = False
+
+# 全局缓存，用于Multiple模式的性能优化
+_multiple_cache = {}
+_cache_lock = threading.Lock()
+_cache_stats = {'hits': 0, 'misses': 0}
+
+def clear_multiple_cache():
+    """清空Multiple模式缓存"""
+    global _multiple_cache, _cache_stats
+    with _cache_lock:
+        _multiple_cache.clear()
+        _cache_stats = {'hits': 0, 'misses': 0}
+
+def get_cache_stats():
+    """获取缓存统计信息"""
+    with _cache_lock:
+        return _cache_stats.copy()
 
 
 @dataclass
@@ -92,7 +111,7 @@ def evaluate_individual_fitness_independent(individual_data):
 
 
 def evaluate_individual_fitness_multiple(individual_data):
-    """评估个体适应度的全局函数 - 联合遮蔽模式"""
+    """评估个体适应度的全局函数 - 联合遮蔽模式（优化版）"""
     if not HAS_MULTIPLE_MASKING:
         return evaluate_individual_fitness_independent(individual_data)
     
@@ -111,8 +130,19 @@ def evaluate_individual_fitness_multiple(individual_data):
             'smoke_c_explode_delay': position[7]    # 烟幕弹C引信延时
         }
         
-        # 计算适应度 - 使用联合遮蔽模式
-        duration = calculate_single_uav_triple_smoke_masking_multiple(
+        # 🚀 优化策略1：缓存机制
+        # 创建缓存键（降低精度以提高缓存命中率）
+        cache_key = tuple(round(x, 3) for x in position)
+        
+        with _cache_lock:
+            if cache_key in _multiple_cache:
+                _cache_stats['hits'] += 1
+                return _multiple_cache[cache_key]
+            _cache_stats['misses'] += 1
+        
+        # 🚀 优化策略2：先用独立模式快速筛选，再用联合模式精确计算
+        # 如果独立模式结果很差，直接返回，避免昂贵的联合计算
+        independent_duration = calculate_single_uav_triple_smoke_masking(
             uav_direction=params['theta_FY1'],
             uav_speed=params['v_FY1'],
             smoke_a_deploy_time=params['smoke_a_deploy_time'],
@@ -120,8 +150,35 @@ def evaluate_individual_fitness_multiple(individual_data):
             smoke_b_deploy_delay=params['smoke_b_deploy_delay'],
             smoke_b_explode_delay=params['smoke_b_explode_delay'],
             smoke_c_deploy_delay=params['smoke_c_deploy_delay'],
-            smoke_c_explode_delay=params['smoke_c_explode_delay']
+            smoke_c_explode_delay=params['smoke_c_explode_delay'],
+            algorithm="adaptive"  # 使用自适应算法
         )
+        
+        # 如果独立模式结果太差（<3秒），直接返回，不进行昂贵的联合计算
+        if independent_duration < 3.0:
+            duration = independent_duration
+        else:
+            # 计算适应度 - 使用联合遮蔽模式（仅对有希望的解进行精确计算）
+            duration = calculate_single_uav_triple_smoke_masking_multiple(
+                uav_direction=params['theta_FY1'],
+                uav_speed=params['v_FY1'],
+                smoke_a_deploy_time=params['smoke_a_deploy_time'],
+                smoke_a_explode_delay=params['smoke_a_explode_delay'],
+                smoke_b_deploy_delay=params['smoke_b_deploy_delay'],
+                smoke_b_explode_delay=params['smoke_b_explode_delay'],
+                smoke_c_deploy_delay=params['smoke_c_deploy_delay'],
+                smoke_c_explode_delay=params['smoke_c_explode_delay']
+            )
+        
+        # 缓存结果
+        with _cache_lock:
+            _multiple_cache[cache_key] = duration
+            # 限制缓存大小
+            if len(_multiple_cache) > 2000:
+                # 清除最旧的1000个条目
+                keys_to_remove = list(_multiple_cache.keys())[:1000]
+                for key in keys_to_remove:
+                    del _multiple_cache[key]
         
         return duration
         
@@ -822,29 +879,52 @@ def main():
     """主函数"""
     print("问题3：差分进化算法求解单无人机三烟幕弹最优策略")
     
-    # 设置DE算法参数（针对高维优化调优）
-    de_params = {
-        'population_size': 100,         # 增大种群以应对8维问题
-        'max_generations': 1000,        # 增加代数
-        'F_min': 0.2,                  # 扩大F范围
-        'F_max': 1.5,
-        'CR_min': 0.05,                # 扩大CR范围
-        'CR_max': 0.95,
-        'use_parallel': True,           # 使用并行计算
-        'restart_threshold': 60,        # 高维问题需要更长的停滞容忍
-        'local_search_prob': 0.15,     # 局部搜索概率
-        'multi_population': True,       # 多子种群
-        'n_subpopulations': 4,          # 4个子种群
-        'migration_interval': 25,       # 迁移间隔
-        'elite_rate': 0.1              # 精英保留率
-    }
+    # 选择遮蔽模式
+    masking_mode = "multiple" if HAS_MULTIPLE_MASKING else "independent"
+    
+    # 清空缓存
+    if masking_mode == "multiple":
+        clear_multiple_cache()
+    
+    # 设置DE算法参数（针对Multiple模式优化）
+    if masking_mode == "multiple":
+        # Multiple模式：减少计算量，因为单次评估成本很高
+        de_params = {
+            'population_size': 60,          # 减少种群大小
+            'max_generations': 300,         # 减少代数
+            'F_min': 0.2,                  
+            'F_max': 1.5,
+            'CR_min': 0.05,                
+            'CR_max': 0.95,
+            'use_parallel': True,           
+            'restart_threshold': 40,        # 减少重启阈值
+            'local_search_prob': 0.08,      # 减少局部搜索概率
+            'multi_population': True,       
+            'n_subpopulations': 3,          # 减少子种群数量
+            'migration_interval': 20,       
+            'elite_rate': 0.15             # 增加精英保留率
+        }
+    else:
+        # Independent模式：可以使用更大的参数，因为计算速度快
+        de_params = {
+            'population_size': 100,         
+            'max_generations': 1000,        
+            'F_min': 0.2,                  
+            'F_max': 1.5,
+            'CR_min': 0.05,                
+            'CR_max': 0.95,
+            'use_parallel': True,           
+            'restart_threshold': 60,        
+            'local_search_prob': 0.15,     
+            'multi_population': True,       
+            'n_subpopulations': 4,          
+            'migration_interval': 25,       
+            'elite_rate': 0.1              
+        }
     
     print(f"\n问题3差分进化算法参数：")
     for key, value in de_params.items():
         print(f"  {key}: {value}")
-    
-    # 选择遮蔽模式
-    masking_mode = "multiple" if HAS_MULTIPLE_MASKING else "independent"
     
     # 创建优化器
     optimizer = DifferentialEvolution_Problem3(masking_mode=masking_mode, **de_params)
@@ -859,6 +939,17 @@ def main():
     end_time = time.time()
     
     print(f"\n优化完成，总用时: {end_time - start_time:.2f} 秒")
+    
+    # 性能统计
+    if masking_mode == "multiple":
+        cache_stats = get_cache_stats()
+        total_calls = cache_stats['hits'] + cache_stats['misses']
+        hit_rate = cache_stats['hits'] / max(1, total_calls) * 100
+        print(f"\nMultiple模式性能统计:")
+        print(f"  总函数调用次数: {total_calls}")
+        print(f"  缓存命中次数: {cache_stats['hits']}")
+        print(f"  缓存命中率: {hit_rate:.1f}%")
+        print(f"  缓存大小: {len(_multiple_cache)}")
     
     # 分析结果
     best_params = analyze_problem3_de_results(best_position, best_fitness, 
@@ -886,6 +977,11 @@ def main():
     }
     
     print(f"\n问题3差分进化优化结果已保存")
+    
+    # 清理资源
+    if masking_mode == "multiple":
+        clear_multiple_cache()
+        print("已清理Multiple模式缓存")
     
     return results
 
