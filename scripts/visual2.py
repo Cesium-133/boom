@@ -287,7 +287,7 @@ class Problem2Visualizer:
                 # 对于角度，使用更细的采样
                 param_values = np.linspace(param_min, param_max, 72)  # 每5度一个点
             else:
-                param_values = np.linspace(param_min, param_max, 50)
+                param_values = np.linspace(param_min, param_max, 100)
             
             durations = []
             
@@ -395,11 +395,11 @@ def main():
     # 如果没有运行PSO，使用默认的较好参数
     best_params = {
         'v_FY1': 140.0,      # 无人机速度
-        'theta_FY1': 5.15,   # 无人机方向 (朝向虚假目标)
-        't_deploy': 0.769,     # 投放时间
-        't_fuse': 0.156        # 引信延时
+        'theta_FY1': 5.33,   # 无人机方向 (朝向虚假目标)
+        't_deploy': 0.617,     # 投放时间
+        't_fuse': 0.287        # 引信延时
     }
-    
+
     # 如果想要使用真实的PSO优化结果，可以先运行Problem2-PSO-Enhanced.py
     # 然后在这里加载结果
     

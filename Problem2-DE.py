@@ -28,6 +28,8 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 import multiprocessing as mp
 from dataclasses import dataclass
 import copy
+import signal
+import sys
 
 # 导入求解器
 from solver import calculate_single_uav_single_smoke_masking, TARGETS, MISSILES
@@ -169,7 +171,8 @@ class DifferentialEvolution:
         self.best_individual = None
         self.best_fitness = -np.inf
         
-        # 历史记录
+        # 历史记录（限制长度以防止内存泄漏）
+        self.max_history_length = 300  # Problem2维度较低，历史记录可以短一些
         self.fitness_history = []
         self.diversity_history = []
         self.parameter_history = {'F': [], 'CR': []}
@@ -180,6 +183,9 @@ class DifferentialEvolution:
         if self.use_parallel:
             self.n_processes = min(mp.cpu_count(), population_size)
             print(f"将使用 {self.n_processes} 个进程进行并行计算")
+        
+        # 中断处理标志
+        self.interrupted = False
     
     def _initialize_population(self):
         """初始化种群"""
@@ -383,23 +389,44 @@ class DifferentialEvolution:
         
         return final_population
     
+    def _signal_handler(self, signum, frame):
+        """处理中断信号"""
+        print("\n\n⚠️  检测到中断信号 (Ctrl+C)")
+        print("正在保存当前最优结果并显示可视化...")
+        self.interrupted = True
+    
     def optimize(self) -> Tuple[np.ndarray, float]:
         """执行差分进化优化"""
         print("="*60)
         print("开始差分进化算法优化")
         print("="*60)
+        print("💡 提示: 按 Ctrl+C 可随时中断并查看当前最优结果")
+        
+        # 设置信号处理器
+        signal.signal(signal.SIGINT, self._signal_handler)
         
         # 初始化种群
         self._initialize_population()
         
         # 主优化循环
         for generation in range(self.max_generations):
+            # 检查中断信号
+            if self.interrupted:
+                print(f"\n🛑 优化在第 {generation+1} 代被中断")
+                break
+                
+            generation_start_time = time.time()  # 记录每代开始时间
             print(f"\n第 {generation+1}/{self.max_generations} 代")
             
             # 自适应参数
             F, CR = self._adaptive_parameters(generation)
             self.parameter_history['F'].append(F)
             self.parameter_history['CR'].append(CR)
+            
+            # 限制参数历史长度
+            if len(self.parameter_history['F']) > self.max_history_length:
+                self.parameter_history['F'] = self.parameter_history['F'][-self.max_history_length//2:]
+                self.parameter_history['CR'] = self.parameter_history['CR'][-self.max_history_length//2:]
             
             # 选择变异策略
             strategy = self._select_mutation_strategy(generation)
@@ -446,10 +473,13 @@ class DifferentialEvolution:
             diversity = self._calculate_diversity()
             self.diversity_history.append(diversity)
             
-            # 记录历史
+            # 记录历史（限制长度）
             self.fitness_history.append(self.best_fitness)
+            if len(self.fitness_history) > self.max_history_length:
+                self.fitness_history = self.fitness_history[-self.max_history_length//2:]
             
             # 输出信息
+            generation_time = time.time() - generation_start_time
             improvement = self.best_fitness - prev_best
             success_rate = successful_mutations / self.population_size
             
@@ -457,6 +487,7 @@ class DifferentialEvolution:
             print(f"  参数: F={F:.3f}, CR={CR:.3f}")
             print(f"  最佳适应度: {self.best_fitness:.6f} (改进: {improvement:+.6f})")
             print(f"  成功率: {success_rate:.1%}, 多样性: {diversity:.4f}")
+            print(f"  本代用时: {generation_time:.2f}s")
             
             # 检查是否达到很好的结果
             if self.best_fitness >= 4.5:
@@ -468,6 +499,14 @@ class DifferentialEvolution:
                 if recent_improvement < 1e-6:
                     print(f"  算法收敛，提前结束于第 {generation+1} 代")
                     break
+        
+        # 如果被中断，显示中断信息
+        if self.interrupted:
+            print("\n" + "="*60)
+            print("🛑 优化过程被用户中断")
+            print("="*60)
+            print(f"已完成 {len(self.fitness_history)} 代优化")
+            print(f"当前最佳适应度: {self.best_fitness:.6f}")
         
         return self.best_individual.position, self.best_fitness
     
@@ -585,21 +624,38 @@ def main():
     
     # 执行优化
     start_time = time.time()
-    best_position, best_fitness = optimizer.optimize()
-    end_time = time.time()
+    try:
+        best_position, best_fitness = optimizer.optimize()
+        end_time = time.time()
+        
+        if optimizer.interrupted:
+            print(f"\n⚠️  优化被中断，总用时: {end_time - start_time:.2f} 秒")
+        else:
+            print(f"\n✅ 优化完成，总用时: {end_time - start_time:.2f} 秒")
+    except KeyboardInterrupt:
+        # 如果在optimize函数外被中断
+        end_time = time.time()
+        print(f"\n⚠️  优化被中断，总用时: {end_time - start_time:.2f} 秒")
+        best_position = optimizer.best_individual.position if optimizer.best_individual else None
+        best_fitness = optimizer.best_fitness
     
-    print(f"\n优化完成，总用时: {end_time - start_time:.2f} 秒")
-    
-    # 分析结果
-    best_params = analyze_de_results(best_position, best_fitness, optimizer.bounds)
-    
-    # 绘制收敛曲线
-    optimizer.plot_convergence()
+    # 分析结果（即使被中断也要显示）
+    if best_position is not None:
+        best_params = analyze_de_results(best_position, best_fitness, optimizer.bounds)
+        
+        # 绘制收敛曲线（即使被中断也要显示）
+        if len(optimizer.fitness_history) > 0:
+            optimizer.plot_convergence()
+        else:
+            print("⚠️  没有足够的数据绘制收敛曲线")
+    else:
+        print("⚠️  没有有效的优化结果")
+        best_params = None
     
     # 保存结果
     results = {
         'best_params': best_params,
-        'best_fitness': best_fitness,
+        'best_fitness': best_fitness if best_position is not None else -np.inf,
         'optimization_time': end_time - start_time,
         'de_params': de_params,
         'bounds': optimizer.bounds,
@@ -609,10 +665,14 @@ def main():
         'strategy_statistics': {
             'usage_count': optimizer.strategy_usage_count,
             'success_count': optimizer.strategy_success_count
-        }
+        },
+        'interrupted': optimizer.interrupted
     }
     
-    print(f"\n差分进化优化结果已保存")
+    if optimizer.interrupted:
+        print(f"\n⚠️  差分进化优化结果已保存（被中断）")
+    else:
+        print(f"\n✅ 差分进化优化结果已保存")
     
     return results
 

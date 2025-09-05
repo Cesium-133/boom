@@ -1,8 +1,8 @@
 """
-问题3：差分进化算法求解单无人机三烟幕弹最优策略
+问题4：差分进化算法求解多无人机协同烟幕遮蔽最优策略
 
 差分进化算法特性：
-1. 适应高维复杂优化问题（8个决策变量）
+1. 适应高维复杂优化问题（12个决策变量）
 2. 支持两种遮蔽计算模式：独立遮蔽 vs 联合遮蔽
 3. 多种变异策略动态选择
 4. 自适应参数调整机制
@@ -14,10 +14,18 @@
 - 使用Numba JIT编译加速核心几何计算
 - 采用自适应步长算法优化时间区间查找
 - LRU缓存减少重复计算
-- 多烟幕弹协同遮蔽效应建模
+- 多无人机多烟幕弹协同遮蔽效应建模
 
-目标：找到最优的无人机速度、飞行方向和3个烟幕弹的投放时间、引信延时，
+目标：找到最优的3架无人机的速度、飞行方向和3个烟幕弹的投放时间、引信延时，
 使得有效遮蔽时长最大化。
+
+决策变量（12个）：
+- uav_a_direction, uav_a_speed: 无人机FY1的方向和速度
+- uav_b_direction, uav_b_speed: 无人机FY2的方向和速度  
+- uav_c_direction, uav_c_speed: 无人机FY3的方向和速度
+- smoke_a_deploy_time, smoke_a_explode_delay: 烟幕弹A的投放时间和引信延时
+- smoke_b_deploy_time, smoke_b_explode_delay: 烟幕弹B的投放时间和引信延时
+- smoke_c_deploy_time, smoke_c_explode_delay: 烟幕弹C的投放时间和引信延时
 """
 
 import numpy as np
@@ -36,13 +44,14 @@ import sys
 
 # 导入求解器
 from solver import (
-    calculate_single_uav_triple_smoke_masking,
-    calculate_single_uav_triple_smoke_masking_multiple,
-    TARGETS, MISSILES, SMOKE_PARAMS
+    calculate_multi_uav_single_smoke_masking,
+    calculate_multi_uav_single_smoke_masking_multiple,
+    TARGETS, MISSILES, SMOKE_PARAMS, UAVS
 )
 from solver.trajectory import TrajectoryCalculator
 
-HAS_MULTIPLE_MASKING = True
+# 检查联合遮蔽函数是否可用
+HAS_MULTIPLE_MASKING = False
 
 # 配置matplotlib中文显示
 plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'DejaVu Sans']
@@ -71,13 +80,13 @@ def _efficient_cache_cleanup():
     """高效的LRU缓存清理"""
     global _multiple_cache, _cache_access_order
     
-    # 只保留最近使用的1000个条目
-    if len(_cache_access_order) > 1500:
-        # 移除最旧的500个条目
-        keys_to_remove = _cache_access_order[:500]
+    # 只保留最近使用的800个条目（Problem4计算更复杂，缓存容量适当减少）
+    if len(_cache_access_order) > 1200:
+        # 移除最旧的400个条目
+        keys_to_remove = _cache_access_order[:400]
         for key in keys_to_remove:
             _multiple_cache.pop(key, None)
-        _cache_access_order = _cache_access_order[500:]
+        _cache_access_order = _cache_access_order[400:]
 
 
 @dataclass
@@ -94,29 +103,36 @@ def evaluate_individual_fitness_independent(individual_data):
     position, bounds_list = individual_data
     
     try:
-        # 解码位置 - 8个决策变量
+        # 解码位置 - 12个决策变量
         params = {
-            'v_FY1': position[0],           # 无人机速度
-            'theta_FY1': position[1],       # 无人机方向
-            'smoke_a_deploy_time': position[2],     # 烟幕弹A投放时间
-            'smoke_a_explode_delay': position[3],   # 烟幕弹A引信延时
-            'smoke_b_deploy_delay': position[4],    # 烟幕弹B相对A的投放延时
-            'smoke_b_explode_delay': position[5],   # 烟幕弹B引信延时
-            'smoke_c_deploy_delay': position[6],    # 烟幕弹C相对B的投放延时
-            'smoke_c_explode_delay': position[7]    # 烟幕弹C引信延时
+            'uav_a_direction': position[0],         # 无人机FY1方向
+            'uav_a_speed': position[1],             # 无人机FY1速度
+            'uav_b_direction': position[2],         # 无人机FY2方向
+            'uav_b_speed': position[3],             # 无人机FY2速度
+            'uav_c_direction': position[4],         # 无人机FY3方向
+            'uav_c_speed': position[5],             # 无人机FY3速度
+            'smoke_a_deploy_time': position[6],     # 烟幕弹A投放时间
+            'smoke_a_explode_delay': position[7],   # 烟幕弹A引信延时
+            'smoke_b_deploy_time': position[8],     # 烟幕弹B投放时间
+            'smoke_b_explode_delay': position[9],   # 烟幕弹B引信延时
+            'smoke_c_deploy_time': position[10],    # 烟幕弹C投放时间
+            'smoke_c_explode_delay': position[11]   # 烟幕弹C引信延时
         }
         
-        # 计算适应度 - 使用独立遮蔽模式 + 自适应步长算法
-        duration = calculate_single_uav_triple_smoke_masking(
-            uav_direction=params['theta_FY1'],
-            uav_speed=params['v_FY1'],
+        # 计算适应度 - 使用独立遮蔽模式
+        duration = calculate_multi_uav_single_smoke_masking(
+            uav_a_direction=params['uav_a_direction'],
+            uav_a_speed=params['uav_a_speed'],
+            uav_b_direction=params['uav_b_direction'],
+            uav_b_speed=params['uav_b_speed'],
+            uav_c_direction=params['uav_c_direction'],
+            uav_c_speed=params['uav_c_speed'],
             smoke_a_deploy_time=params['smoke_a_deploy_time'],
             smoke_a_explode_delay=params['smoke_a_explode_delay'],
-            smoke_b_deploy_delay=params['smoke_b_deploy_delay'],
+            smoke_b_deploy_time=params['smoke_b_deploy_time'],
             smoke_b_explode_delay=params['smoke_b_explode_delay'],
-            smoke_c_deploy_delay=params['smoke_c_deploy_delay'],
-            smoke_c_explode_delay=params['smoke_c_explode_delay'],
-            algorithm="adaptive"  # 使用自适应步长算法
+            smoke_c_deploy_time=params['smoke_c_deploy_time'],
+            smoke_c_explode_delay=params['smoke_c_explode_delay']
         )
         
         return duration
@@ -134,16 +150,20 @@ def evaluate_individual_fitness_multiple(individual_data):
     position, bounds_list = individual_data
     
     try:
-        # 解码位置 - 8个决策变量
+        # 解码位置 - 12个决策变量
         params = {
-            'v_FY1': position[0],           # 无人机速度
-            'theta_FY1': position[1],       # 无人机方向
-            'smoke_a_deploy_time': position[2],     # 烟幕弹A投放时间
-            'smoke_a_explode_delay': position[3],   # 烟幕弹A引信延时
-            'smoke_b_deploy_delay': position[4],    # 烟幕弹B相对A的投放延时
-            'smoke_b_explode_delay': position[5],   # 烟幕弹B引信延时
-            'smoke_c_deploy_delay': position[6],    # 烟幕弹C相对B的投放延时
-            'smoke_c_explode_delay': position[7]    # 烟幕弹C引信延时
+            'uav_a_direction': position[0],         # 无人机FY1方向
+            'uav_a_speed': position[1],             # 无人机FY1速度
+            'uav_b_direction': position[2],         # 无人机FY2方向
+            'uav_b_speed': position[3],             # 无人机FY2速度
+            'uav_c_direction': position[4],         # 无人机FY3方向
+            'uav_c_speed': position[5],             # 无人机FY3速度
+            'smoke_a_deploy_time': position[6],     # 烟幕弹A投放时间
+            'smoke_a_explode_delay': position[7],   # 烟幕弹A引信延时
+            'smoke_b_deploy_time': position[8],     # 烟幕弹B投放时间
+            'smoke_b_explode_delay': position[9],   # 烟幕弹B引信延时
+            'smoke_c_deploy_time': position[10],    # 烟幕弹C投放时间
+            'smoke_c_explode_delay': position[11]   # 烟幕弹C引信延时
         }
         
         # 🚀 优化策略1：高效缓存机制
@@ -162,31 +182,38 @@ def evaluate_individual_fitness_multiple(individual_data):
         
         # 🚀 优化策略2：先用独立模式快速筛选，再用联合模式精确计算
         # 如果独立模式结果很差，直接返回，避免昂贵的联合计算
-        independent_duration = calculate_single_uav_triple_smoke_masking(
-            uav_direction=params['theta_FY1'],
-            uav_speed=params['v_FY1'],
+        independent_duration = calculate_multi_uav_single_smoke_masking(
+            uav_a_direction=params['uav_a_direction'],
+            uav_a_speed=params['uav_a_speed'],
+            uav_b_direction=params['uav_b_direction'],
+            uav_b_speed=params['uav_b_speed'],
+            uav_c_direction=params['uav_c_direction'],
+            uav_c_speed=params['uav_c_speed'],
             smoke_a_deploy_time=params['smoke_a_deploy_time'],
             smoke_a_explode_delay=params['smoke_a_explode_delay'],
-            smoke_b_deploy_delay=params['smoke_b_deploy_delay'],
+            smoke_b_deploy_time=params['smoke_b_deploy_time'],
             smoke_b_explode_delay=params['smoke_b_explode_delay'],
-            smoke_c_deploy_delay=params['smoke_c_deploy_delay'],
-            smoke_c_explode_delay=params['smoke_c_explode_delay'],
-            algorithm="adaptive"  # 使用自适应算法
+            smoke_c_deploy_time=params['smoke_c_deploy_time'],
+            smoke_c_explode_delay=params['smoke_c_explode_delay']
         )
         
-        # 如果独立模式结果太差（<3秒），直接返回，不进行昂贵的联合计算
-        if independent_duration < 3.0:
+        # 如果独立模式结果太差（<2秒），直接返回，不进行昂贵的联合计算
+        if independent_duration < 2.0:
             duration = independent_duration
         else:
             # 计算适应度 - 使用联合遮蔽模式（仅对有希望的解进行精确计算）
-            duration = calculate_single_uav_triple_smoke_masking_multiple(
-                uav_direction=params['theta_FY1'],
-                uav_speed=params['v_FY1'],
+            duration = calculate_multi_uav_single_smoke_masking_multiple(
+                uav_a_direction=params['uav_a_direction'],
+                uav_a_speed=params['uav_a_speed'],
+                uav_b_direction=params['uav_b_direction'],
+                uav_b_speed=params['uav_b_speed'],
+                uav_c_direction=params['uav_c_direction'],
+                uav_c_speed=params['uav_c_speed'],
                 smoke_a_deploy_time=params['smoke_a_deploy_time'],
                 smoke_a_explode_delay=params['smoke_a_explode_delay'],
-                smoke_b_deploy_delay=params['smoke_b_deploy_delay'],
+                smoke_b_deploy_time=params['smoke_b_deploy_time'],
                 smoke_b_explode_delay=params['smoke_b_explode_delay'],
-                smoke_c_deploy_delay=params['smoke_c_deploy_delay'],
+                smoke_c_deploy_time=params['smoke_c_deploy_time'],
                 smoke_c_explode_delay=params['smoke_c_explode_delay']
             )
         
@@ -196,7 +223,7 @@ def evaluate_individual_fitness_multiple(individual_data):
             _cache_access_order.append(cache_key)
             
             # 高效缓存管理
-            if len(_multiple_cache) > 1500:
+            if len(_multiple_cache) > 1200:
                 _efficient_cache_cleanup()
         
         return duration
@@ -224,27 +251,34 @@ def calculate_bounds():
     
     print(f"导弹到达虚假目标时间: {t_max:.2f}s")
     
-    # 8个决策变量的边界
+    # 12个决策变量的边界
     bounds = {
-        'v_FY1': (70.0, 140.0),              # 无人机速度
-        'theta_FY1': (0.0, 360.0),           # 无人机方向
-        'smoke_a_deploy_time': (0.1, t_max - 5.0),    # 烟幕弹A投放时间
-        'smoke_a_explode_delay': (0.1, 10.0),         # 烟幕弹A引信延时
-        'smoke_b_deploy_delay': (0.1, 10.0),          # 烟幕弹B投放延时（相对A）
-        'smoke_b_explode_delay': (0.1, 10.0),         # 烟幕弹B引信延时
-        'smoke_c_deploy_delay': (0.1, 10.0),          # 烟幕弹C投放延时（相对B）
-        'smoke_c_explode_delay': (0.1, 10.0)          # 烟幕弹C引信延时
+        # 无人机参数
+        'uav_a_direction': (0.0, 360.0),           # 无人机FY1方向
+        'uav_a_speed': (70.0, 140.0),              # 无人机FY1速度
+        'uav_b_direction': (0.0, 360.0),           # 无人机FY2方向
+        'uav_b_speed': (70.0, 140.0),              # 无人机FY2速度
+        'uav_c_direction': (0.0, 360.0),           # 无人机FY3方向
+        'uav_c_speed': (70.0, 140.0),              # 无人机FY3速度
+        
+        # 烟幕弹参数
+        'smoke_a_deploy_time': (0.1, t_max - 5.0), # 烟幕弹A投放时间
+        'smoke_a_explode_delay': (0.1, 10.0),      # 烟幕弹A引信延时
+        'smoke_b_deploy_time': (0.1, t_max - 5.0), # 烟幕弹B投放时间
+        'smoke_b_explode_delay': (0.1, 10.0),      # 烟幕弹B引信延时
+        'smoke_c_deploy_time': (0.1, t_max - 5.0), # 烟幕弹C投放时间
+        'smoke_c_explode_delay': (0.1, 10.0)       # 烟幕弹C引信延时
     }
     
     return bounds
 
 
-class DifferentialEvolution_Problem3:
-    """问题3差分进化算法优化器"""
+class DifferentialEvolution_Problem4:
+    """问题4差分进化算法优化器"""
     
     def __init__(self,
-                 population_size: int = 100,          # 增大种群以应对高维问题
-                 max_generations: int = 1000,         # 增加代数
+                 population_size: int = 80,           # 适中的种群大小应对12维问题
+                 max_generations: int = 800,          # 适中的代数
                  F_min: float = 0.2,                 # 扩大F范围
                  F_max: float = 1.5,
                  CR_min: float = 0.05,               # 扩大CR范围
@@ -252,14 +286,14 @@ class DifferentialEvolution_Problem3:
                  bounds: Dict[str, Tuple[float, float]] = None,
                  use_parallel: bool = True,
                  masking_mode: str = "independent",   # "independent" or "multiple"
-                 restart_threshold: int = 60,         # 高维问题需要更长的停滞容忍
-                 local_search_prob: float = 0.15,
+                 restart_threshold: int = 50,         # 高维问题需要更长的停滞容忍
+                 local_search_prob: float = 0.12,
                  multi_population: bool = True,
                  n_subpopulations: int = 4,
-                 migration_interval: int = 25,
+                 migration_interval: int = 20,
                  elite_rate: float = 0.1):
         """
-        初始化问题3差分进化算法
+        初始化问题4差分进化算法
         
         Args:
             masking_mode: 遮蔽计算模式
@@ -296,7 +330,7 @@ class DifferentialEvolution_Problem3:
             self.bounds = bounds
             
         self.bounds_list = list(self.bounds.values())
-        self.n_dims = len(self.bounds_list)  # 8个决策变量
+        self.n_dims = len(self.bounds_list)  # 12个决策变量
         
         # 针对高维问题的变异策略
         self.mutation_strategies = [
@@ -324,7 +358,7 @@ class DifferentialEvolution_Problem3:
         self.best_fitness = -np.inf
         
         # 历史记录（限制长度以防止内存泄漏）
-        self.max_history_length = 500  # 限制历史记录长度
+        self.max_history_length = 400  # Problem4维度更高，历史记录适中
         self.fitness_history = []
         self.diversity_history = []
         self.parameter_history = {'F': [], 'CR': []}
@@ -385,30 +419,41 @@ class DifferentialEvolution_Problem3:
                 for i, (min_val, max_val) in enumerate(self.bounds_list):
                     position[i] = np.random.uniform(min_val, max_val)
             elif subpop_idx == 1:
-                # 子种群1：偏向高速度
-                position[0] = np.random.uniform(110, 140)  # 高速度
-                position[1] = np.random.uniform(0, 360)    # 随机方向
-                for i in range(2, self.n_dims):
+                # 子种群1：偏向高速度策略
+                position[1] = np.random.uniform(110, 140)  # FY1高速度
+                position[3] = np.random.uniform(110, 140)  # FY2高速度  
+                position[5] = np.random.uniform(110, 140)  # FY3高速度
+                # 其他参数随机
+                for i in [0, 2, 4] + list(range(6, self.n_dims)):
                     min_val, max_val = self.bounds_list[i]
                     position[i] = np.random.uniform(min_val, max_val)
             elif subpop_idx == 2:
-                # 子种群2：偏向早投放
-                position[0] = np.random.uniform(70, 140)   # 随机速度
-                position[1] = np.random.uniform(0, 360)    # 随机方向
-                position[2] = np.random.uniform(0.1, 2.0)  # 早投放
-                for i in range(3, self.n_dims):
+                # 子种群2：偏向早投放策略
+                position[6] = np.random.uniform(0.1, 2.0)   # 早投放A
+                position[8] = np.random.uniform(0.1, 2.0)   # 早投放B
+                position[10] = np.random.uniform(0.1, 2.0)  # 早投放C
+                # 其他参数随机
+                for i in list(range(6)) + [7, 9, 11]:
                     min_val, max_val = self.bounds_list[i]
                     position[i] = np.random.uniform(min_val, max_val)
             else:
-                # 子种群3：偏向密集投放
-                position[0] = np.random.uniform(70, 140)   # 随机速度
-                position[1] = np.random.uniform(0, 360)    # 随机方向
-                position[2] = np.random.uniform(0.1, 5.0)  # 随机投放时间
-                position[3] = np.random.uniform(0.1, 3.0)  # 较短延时
-                position[4] = np.random.uniform(0.1, 2.0)  # 短间隔
-                position[5] = np.random.uniform(0.1, 3.0)  # 较短延时
-                position[6] = np.random.uniform(0.1, 2.0)  # 短间隔
-                position[7] = np.random.uniform(0.1, 3.0)  # 较短延时
+                # 子种群3：偏向协同策略
+                # 相近的飞行方向
+                base_direction = np.random.uniform(0, 360)
+                position[0] = base_direction % 360                        # FY1方向
+                position[2] = (base_direction + 30) % 360                 # FY2方向
+                position[4] = (base_direction - 30) % 360                 # FY3方向
+                
+                # 相近的投放时间
+                base_deploy_time = np.random.uniform(1.0, 5.0)
+                position[6] = base_deploy_time                            # A投放时间
+                position[8] = base_deploy_time + np.random.uniform(0, 1)  # B投放时间
+                position[10] = base_deploy_time + np.random.uniform(0, 1) # C投放时间
+                
+                # 其他参数随机
+                for i in [1, 3, 5, 7, 9, 11]:
+                    min_val, max_val = self.bounds_list[i]
+                    position[i] = np.random.uniform(min_val, max_val)
         else:
             # 单种群：完全随机初始化
             for i, (min_val, max_val) in enumerate(self.bounds_list):
@@ -453,10 +498,10 @@ class DifferentialEvolution_Problem3:
         progress = generation / self.max_generations
         
         # 基于当前最佳适应度的F调整
-        if self.best_fitness < 5.0:
+        if self.best_fitness < 3.0:
             # 初期：大F值，增强全局搜索
             F = self.F_max - (self.F_max - 0.8) * progress
-        elif self.best_fitness < 8.0:
+        elif self.best_fitness < 6.0:
             # 中期：中等F值
             F = 0.8 - (0.8 - 0.5) * progress
         else:
@@ -464,7 +509,7 @@ class DifferentialEvolution_Problem3:
             F = 0.5 - (0.5 - self.F_min) * progress
         
         # 基于停滞情况调整F
-        if self.stagnation_count > 30:
+        if self.stagnation_count > 25:
             F = min(self.F_max, F * 1.3)  # 增强探索
         
         # 高维问题的CR调整
@@ -483,7 +528,7 @@ class DifferentialEvolution_Problem3:
     
     def _select_mutation_strategy(self, generation: int) -> str:
         """选择变异策略（考虑高维问题特点）"""
-        if generation < 20:
+        if generation < 15:
             # 前期：偏向探索性策略
             strategies = ['DE/rand/1', 'DE/rand/2', 'DE/current-to-rand/1']
             return np.random.choice(strategies)
@@ -499,7 +544,7 @@ class DifferentialEvolution_Problem3:
                 success_rates[strategy] = 0.3  # 默认成功率
         
         # 对于高维问题，给予某些策略额外权重
-        if self.best_fitness > 8.0:  # 接近最优时
+        if self.best_fitness > 6.0:  # 接近最优时
             success_rates['DE/best/1'] *= 1.2
             success_rates['DE/current-to-best/1'] *= 1.2
         
@@ -598,13 +643,13 @@ class DifferentialEvolution_Problem3:
             return individual
         
         best_local = copy.deepcopy(individual)
-        search_radius = 0.03  # 更小的搜索半径
+        search_radius = 0.02  # 更小的搜索半径
         
         # 对于高维问题，只搜索部分维度
-        n_dims_to_search = min(4, self.n_dims)  # 最多搜索4个维度
+        n_dims_to_search = min(5, self.n_dims)  # 最多搜索5个维度
         dims_to_search = np.random.choice(self.n_dims, n_dims_to_search, replace=False)
         
-        for _ in range(8):  # 增加尝试次数
+        for _ in range(6):  # 适中的尝试次数
             new_position = individual.position.copy()
             
             # 只在选定的维度上进行扰动
@@ -649,8 +694,8 @@ class DifferentialEvolution_Problem3:
         
         print(f"    触发重启机制 (停滞{self.stagnation_count}代)")
         
-        # 保留最好的25%个体（高维问题需要保留更多精英）
-        n_keep = int(0.25 * self.population_size)
+        # 保留最好的20%个体（高维问题需要保留更多精英）
+        n_keep = int(0.20 * self.population_size)
         self.population.sort(key=lambda x: x.fitness, reverse=True)
         elite = self.population[:n_keep]
         
@@ -674,7 +719,7 @@ class DifferentialEvolution_Problem3:
             return 0.0
         
         # 🚀 性能优化：只采样少量个体进行多样性计算
-        sample_size = min(20, len(self.population))  # 进一步减少采样数量
+        sample_size = min(15, len(self.population))  # 进一步减少采样数量
         if len(self.population) > sample_size:
             sample_indices = np.random.choice(len(self.population), sample_size, replace=False)
             sampled_positions = [self.population[i].position for i in sample_indices]
@@ -689,7 +734,7 @@ class DifferentialEvolution_Problem3:
         distances = []
         
         # 只计算前几个维度的多样性（进一步加速）
-        key_dims = min(4, self.n_dims)  # 只看前4个关键维度
+        key_dims = min(6, self.n_dims)  # 只看前6个关键维度
         
         for i in range(n):
             for j in range(i + 1, n):
@@ -710,7 +755,7 @@ class DifferentialEvolution_Problem3:
     def optimize(self) -> Tuple[np.ndarray, float]:
         """执行差分进化优化"""
         print("="*60)
-        print(f"开始问题3差分进化算法优化 - {self.masking_mode.upper()}模式")
+        print(f"开始问题4差分进化算法优化 - {self.masking_mode.upper()}模式")
         print("="*60)
         print("💡 提示: 按 Ctrl+C 可随时中断并查看当前最优结果")
         
@@ -763,7 +808,7 @@ class DifferentialEvolution_Problem3:
                 if trial_fitness > self.population[i].fitness:
                     new_individual = Individual(position=trial, fitness=trial_fitness, generation=generation)
                     # 局部搜索增强（降低频率以提高性能）
-                    if generation % 3 == 0:  # 每3代进行一次局部搜索
+                    if generation % 4 == 0:  # 每4代进行一次局部搜索
                         new_individual = self._local_search(new_individual)
                     new_population.append(new_individual)
                     successful_mutations += 1
@@ -814,21 +859,21 @@ class DifferentialEvolution_Problem3:
             print(f"  本代用时: {generation_time:.2f}s")
             
             # 定期清理缓存以防止内存泄漏
-            if generation % 50 == 0 and self.masking_mode == "multiple":
+            if generation % 40 == 0 and self.masking_mode == "multiple":
                 with _cache_lock:
-                    if len(_multiple_cache) > 1000:
+                    if len(_multiple_cache) > 800:
                         print(f"  🧹 清理缓存: {len(_multiple_cache)} -> ", end="")
                         _efficient_cache_cleanup()
                         print(f"{len(_multiple_cache)}")
             
             # 检查是否达到很好的结果
-            if self.best_fitness >= 10.0:  # 三烟幕弹的理论上限可能更高
+            if self.best_fitness >= 8.0:  # 多无人机协同的理论上限可能更高
                 print(f"  🎯 发现优秀解！")
             
             # 收敛检查
-            if generation > 50:
-                recent_improvement = max(self.fitness_history[-20:]) - min(self.fitness_history[-40:-20])
-                if recent_improvement < 1e-6 and self.stagnation_count > 80:
+            if generation > 40:
+                recent_improvement = max(self.fitness_history[-15:]) - min(self.fitness_history[-30:-15])
+                if recent_improvement < 1e-6 and self.stagnation_count > 60:
                     print(f"  算法收敛，提前结束于第 {generation+1} 代")
                     break
         
@@ -848,7 +893,7 @@ class DifferentialEvolution_Problem3:
         
         # 适应度收敛曲线
         axes[0, 0].plot(self.fitness_history, 'b-', linewidth=2, label='最佳适应度')
-        axes[0, 0].set_title(f'问题3差分进化收敛曲线 ({self.masking_mode.upper()}模式)')
+        axes[0, 0].set_title(f'问题4差分进化收敛曲线 ({self.masking_mode.upper()}模式)')
         axes[0, 0].set_xlabel('代数')
         axes[0, 0].set_ylabel('适应度（有效遮蔽时长）')
         axes[0, 0].legend()
@@ -892,11 +937,11 @@ class DifferentialEvolution_Problem3:
         plt.show()
 
 
-def analyze_problem3_de_results(best_position: np.ndarray, best_fitness: float, 
+def analyze_problem4_de_results(best_position: np.ndarray, best_fitness: float, 
                                bounds: Dict[str, Tuple[float, float]], masking_mode: str):
-    """分析问题3差分进化结果"""
+    """分析问题4差分进化结果"""
     print("="*60)
-    print(f"问题3差分进化优化结果分析 ({masking_mode.upper()}模式)")
+    print(f"问题4差分进化优化结果分析 ({masking_mode.upper()}模式)")
     print("="*60)
     
     # 解码最优解
@@ -904,52 +949,54 @@ def analyze_problem3_de_results(best_position: np.ndarray, best_fitness: float,
     best_params = {keys[i]: best_position[i] for i in range(len(keys))}
     
     print(f"\n最优策略参数：")
-    print(f"  无人机速度 (v_FY1): {best_params['v_FY1']:.2f} m/s")
-    print(f"  无人机方向 (θ_FY1): {best_params['theta_FY1']:.2f}°")
-    print(f"  烟幕弹A投放时间: {best_params['smoke_a_deploy_time']:.3f} s")
-    print(f"  烟幕弹A引信延时: {best_params['smoke_a_explode_delay']:.3f} s")
-    print(f"  烟幕弹A起爆时间: {best_params['smoke_a_deploy_time'] + best_params['smoke_a_explode_delay']:.3f} s")
+    print(f"📡 无人机参数：")
+    print(f"  FY1 - 方向: {best_params['uav_a_direction']:.2f}°, 速度: {best_params['uav_a_speed']:.2f} m/s")
+    print(f"  FY2 - 方向: {best_params['uav_b_direction']:.2f}°, 速度: {best_params['uav_b_speed']:.2f} m/s")
+    print(f"  FY3 - 方向: {best_params['uav_c_direction']:.2f}°, 速度: {best_params['uav_c_speed']:.2f} m/s")
     
-    # 计算烟幕弹B的绝对时间
-    smoke_b_deploy_time = best_params['smoke_a_deploy_time'] + best_params['smoke_b_deploy_delay']
-    smoke_b_explode_time = smoke_b_deploy_time + best_params['smoke_b_explode_delay']
-    print(f"  烟幕弹B投放时间: {smoke_b_deploy_time:.3f} s (延时: {best_params['smoke_b_deploy_delay']:.3f} s)")
-    print(f"  烟幕弹B引信延时: {best_params['smoke_b_explode_delay']:.3f} s")
-    print(f"  烟幕弹B起爆时间: {smoke_b_explode_time:.3f} s")
+    print(f"\n💣 烟幕弹参数：")
+    print(f"  烟幕弹A - 投放: {best_params['smoke_a_deploy_time']:.3f}s, 延时: {best_params['smoke_a_explode_delay']:.3f}s")
+    print(f"             起爆: {best_params['smoke_a_deploy_time'] + best_params['smoke_a_explode_delay']:.3f}s")
     
-    # 计算烟幕弹C的绝对时间
-    smoke_c_deploy_time = smoke_b_deploy_time + best_params['smoke_c_deploy_delay']
-    smoke_c_explode_time = smoke_c_deploy_time + best_params['smoke_c_explode_delay']
-    print(f"  烟幕弹C投放时间: {smoke_c_deploy_time:.3f} s (延时: {best_params['smoke_c_deploy_delay']:.3f} s)")
-    print(f"  烟幕弹C引信延时: {best_params['smoke_c_explode_delay']:.3f} s")
-    print(f"  烟幕弹C起爆时间: {smoke_c_explode_time:.3f} s")
+    print(f"  烟幕弹B - 投放: {best_params['smoke_b_deploy_time']:.3f}s, 延时: {best_params['smoke_b_explode_delay']:.3f}s")
+    print(f"             起爆: {best_params['smoke_b_deploy_time'] + best_params['smoke_b_explode_delay']:.3f}s")
     
-    print(f"\n最大有效遮蔽时长: {best_fitness:.6f} 秒")
+    print(f"  烟幕弹C - 投放: {best_params['smoke_c_deploy_time']:.3f}s, 延时: {best_params['smoke_c_explode_delay']:.3f}s")
+    print(f"             起爆: {best_params['smoke_c_deploy_time'] + best_params['smoke_c_explode_delay']:.3f}s")
+    
+    print(f"\n🎯 最大有效遮蔽时长: {best_fitness:.6f} 秒")
     
     # 验证结果
-    print(f"\n验证计算...")
+    print(f"\n🔍 验证计算...")
     if masking_mode == "multiple" and HAS_MULTIPLE_MASKING:
-        verification_result = calculate_single_uav_triple_smoke_masking_multiple(
-            uav_direction=best_params['theta_FY1'],
-            uav_speed=best_params['v_FY1'],
+        verification_result = calculate_multi_uav_single_smoke_masking_multiple(
+            uav_a_direction=best_params['uav_a_direction'],
+            uav_a_speed=best_params['uav_a_speed'],
+            uav_b_direction=best_params['uav_b_direction'],
+            uav_b_speed=best_params['uav_b_speed'],
+            uav_c_direction=best_params['uav_c_direction'],
+            uav_c_speed=best_params['uav_c_speed'],
             smoke_a_deploy_time=best_params['smoke_a_deploy_time'],
             smoke_a_explode_delay=best_params['smoke_a_explode_delay'],
-            smoke_b_deploy_delay=best_params['smoke_b_deploy_delay'],
+            smoke_b_deploy_time=best_params['smoke_b_deploy_time'],
             smoke_b_explode_delay=best_params['smoke_b_explode_delay'],
-            smoke_c_deploy_delay=best_params['smoke_c_deploy_delay'],
+            smoke_c_deploy_time=best_params['smoke_c_deploy_time'],
             smoke_c_explode_delay=best_params['smoke_c_explode_delay']
         )
     else:
-        verification_result = calculate_single_uav_triple_smoke_masking(
-            uav_direction=best_params['theta_FY1'],
-            uav_speed=best_params['v_FY1'],
+        verification_result = calculate_multi_uav_single_smoke_masking(
+            uav_a_direction=best_params['uav_a_direction'],
+            uav_a_speed=best_params['uav_a_speed'],
+            uav_b_direction=best_params['uav_b_direction'],
+            uav_b_speed=best_params['uav_b_speed'],
+            uav_c_direction=best_params['uav_c_direction'],
+            uav_c_speed=best_params['uav_c_speed'],
             smoke_a_deploy_time=best_params['smoke_a_deploy_time'],
             smoke_a_explode_delay=best_params['smoke_a_explode_delay'],
-            smoke_b_deploy_delay=best_params['smoke_b_deploy_delay'],
+            smoke_b_deploy_time=best_params['smoke_b_deploy_time'],
             smoke_b_explode_delay=best_params['smoke_b_explode_delay'],
-            smoke_c_deploy_delay=best_params['smoke_c_deploy_delay'],
-            smoke_c_explode_delay=best_params['smoke_c_explode_delay'],
-            algorithm="adaptive"
+            smoke_c_deploy_time=best_params['smoke_c_deploy_time'],
+            smoke_c_explode_delay=best_params['smoke_c_explode_delay']
         )
     print(f"验证结果: {verification_result:.6f} 秒")
     
@@ -958,7 +1005,7 @@ def analyze_problem3_de_results(best_position: np.ndarray, best_fitness: float,
 
 def main():
     """主函数"""
-    print("问题3：差分进化算法求解单无人机三烟幕弹最优策略")
+    print("问题4：差分进化算法求解多无人机协同烟幕遮蔽最优策略")
     
     # 选择遮蔽模式
     masking_mode = "multiple" if HAS_MULTIPLE_MASKING else "independent"
@@ -971,46 +1018,46 @@ def main():
     if masking_mode == "multiple":
         # Multiple模式：减少计算量，因为单次评估成本很高
         de_params = {
-            'population_size': 60,          # 减少种群大小
-            'max_generations': 300,         # 减少代数
+            'population_size': 50,          # 减少种群大小
+            'max_generations': 400,         # 减少代数
             'F_min': 0.2,                  
             'F_max': 1.5,
             'CR_min': 0.05,                
             'CR_max': 0.95,
             'use_parallel': True,           
-            'restart_threshold': 40,        # 减少重启阈值
+            'restart_threshold': 35,        # 减少重启阈值
             'local_search_prob': 0.08,      # 减少局部搜索概率
             'multi_population': True,       
             'n_subpopulations': 3,          # 减少子种群数量
-            'migration_interval': 20,       
+            'migration_interval': 15,       
             'elite_rate': 0.15             # 增加精英保留率
         }
     else:
         # Independent模式：可以使用更大的参数，因为计算速度快
         de_params = {
-            'population_size': 100,         
-            'max_generations': 1000,        
+            'population_size': 80,         
+            'max_generations': 800,        
             'F_min': 0.2,                  
             'F_max': 1.5,
             'CR_min': 0.05,                
             'CR_max': 0.95,
             'use_parallel': True,           
-            'restart_threshold': 60,        
-            'local_search_prob': 0.15,     
+            'restart_threshold': 50,        
+            'local_search_prob': 0.12,     
             'multi_population': True,       
             'n_subpopulations': 4,          
-            'migration_interval': 25,       
+            'migration_interval': 20,       
             'elite_rate': 0.1              
         }
     
-    print(f"\n问题3差分进化算法参数：")
+    print(f"\n问题4差分进化算法参数：")
     for key, value in de_params.items():
         print(f"  {key}: {value}")
     
     # 创建优化器
-    optimizer = DifferentialEvolution_Problem3(masking_mode=masking_mode, **de_params)
+    optimizer = DifferentialEvolution_Problem4(masking_mode=masking_mode, **de_params)
     
-    print(f"\n搜索空间边界（8个决策变量）：")
+    print(f"\n搜索空间边界（12个决策变量）：")
     for param, (min_val, max_val) in optimizer.bounds.items():
         print(f"  {param}: [{min_val:.2f}, {max_val:.2f}]")
     
@@ -1044,15 +1091,9 @@ def main():
         print(f"  缓存命中率: {hit_rate:.1f}%")
         print(f"  缓存大小: {len(_multiple_cache)}")
     
-    # 分析结果
-    best_params = analyze_problem3_de_results(best_position, best_fitness, 
-                                            optimizer.bounds, masking_mode)
-    
-    # 绘制收敛曲线
-    optimizer.plot_convergence()
     # 分析结果（即使被中断也要显示）
     if best_position is not None:
-        best_params = analyze_problem3_de_results(best_position, best_fitness, 
+        best_params = analyze_problem4_de_results(best_position, best_fitness, 
                                                 optimizer.bounds, masking_mode)
         
         # 绘制收敛曲线（即使被中断也要显示）
@@ -1084,9 +1125,9 @@ def main():
     }
     
     if optimizer.interrupted:
-        print(f"\n⚠️  问题3差分进化优化结果已保存（被中断）")
+        print(f"\n⚠️  问题4差分进化优化结果已保存（被中断）")
     else:
-        print(f"\n✅ 问题3差分进化优化结果已保存")
+        print(f"\n✅ 问题4差分进化优化结果已保存")
     
     # 清理资源
     if masking_mode == "multiple":

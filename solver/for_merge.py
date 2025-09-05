@@ -235,23 +235,8 @@ def is_cylinder_covered_at_t(
     vy = nz*ux - nx*uz
     vz = nx*uy - ny*ux
 
-    # 圆锥参数
-    axis_unit, alpha = compute_tangent_cone_to_sphere(p0_t, p1_t, sphere_radius_for_cone)
-    wx, wy, wz = axis_unit
-    cos2 = math.cos(alpha)**2
-
-    # 预计算量
+    # 预计算量（对所有圆锥都相同）
     r0 = (O[0]-p0_t[0], O[1]-p0_t[1], O[2]-p0_t[2])
-    def dot_w(x,y,z):
-        return wx*x + wy*y + wz*z
-    def quad_F(s, t):
-        # r = r0 + s u + t v
-        rx = r0[0] + s*ux + t*vx
-        ry = r0[1] + s*uy + t*vy
-        rz = r0[2] + s*uz + t*vz
-        rw = dot_w(rx, ry, rz)
-        rr = rx*rx + ry*ry + rz*rz
-        return (rw*rw - cos2*rr), rw
 
     # 从 traj0 视角计算圆柱在切平面上的投影区域（使用新的近似方法）
     # 注意：这个投影区域会随着 traj0(t) 的变化而变化
@@ -306,9 +291,6 @@ def is_cylinder_covered_at_t(
         cos2 = math.cos(alpha)**2
         cone_params.append((wx, wy, wz, cos2))
     
-    # 预计算量（对所有圆锥都相同）
-    r0 = (O[0]-p0_t[0], O[1]-p0_t[1], O[2]-p0_t[2])
-    
     # 在投影区域中采样点，检查是否被多个圆锥的并集覆盖
     axis_samples = np.linspace(0, proj_axis_len, 20)
     perp_samples = np.linspace(-proj_width, proj_width, 10)
@@ -330,6 +312,7 @@ def is_cylinder_covered_at_t(
             # 检查这个点是否被任何一个圆锥覆盖
             covered_by_any_cone = False
             for wx, wy, wz, cos2 in cone_params:
+                # 计算当前圆锥的覆盖判断
                 def dot_w(x,y,z):
                     return wx*x + wy*y + wz*z
                 def quad_F(s, t):

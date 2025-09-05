@@ -585,4 +585,104 @@ def calculate_single_uav_triple_smoke_masking_multiple(
     return total_duration
 
 
+def calculate_multi_uav_single_smoke_masking_multiple(
+    uav_a_direction: float,
+    uav_a_speed: float,
+    uav_b_direction: float,
+    uav_b_speed: float,
+    uav_c_direction: float,
+    uav_c_speed: float,
+    smoke_a_deploy_time: float,
+    smoke_a_explode_delay: float,
+    smoke_b_deploy_time: float,
+    smoke_b_explode_delay: float,
+    smoke_c_deploy_time: float,
+    smoke_c_explode_delay: float
+) -> float:
+    """
+    计算多无人机多烟幕弹单导弹的有效遮蔽时长 - 联合遮挡版本
+    
+    与 calculate_multi_uav_single_smoke_masking 的区别：
+    - 原版本：任意一个烟幕弹独立满足遮挡条件即可
+    - 此版本：考虑多个烟幕弹联合遮挡的协同效应
+    
+    Args:
+        uav_a_direction: 无人机A飞行方向（度，0-360）
+        uav_a_speed: 无人机A飞行速度（m/s）
+        uav_b_direction: 无人机B飞行方向（度，0-360）
+        uav_b_speed: 无人机B飞行速度（m/s）
+        uav_c_direction: 无人机C飞行方向（度，0-360）
+        uav_c_speed: 无人机C飞行速度（m/s）
+        smoke_a_deploy_time: 烟幕弹A投放时间（s）
+        smoke_a_explode_delay: 烟幕弹A起爆延时（s）
+        smoke_b_deploy_time: 烟幕弹B投放时间（s）
+        smoke_b_explode_delay: 烟幕弹B起爆延时（s）
+        smoke_c_deploy_time: 烟幕弹C投放时间（s）
+        smoke_c_explode_delay: 烟幕弹C起爆延时（s）
+        
+    Returns:
+        有效遮蔽时长（s）
+    """
+    # 导入联合遮挡计算函数
+    from .for_merge import find_full_cover_intervals
+    
+    calc = MaskingCalculator()
+    
+    # 创建导弹轨迹
+    missile_traj = calc.traj_calc.create_missile_trajectory("M1")
+    
+    # 创建三架不同无人机的轨迹
+    uav_a_traj = calc.traj_calc.create_uav_trajectory("FY1", direction_degrees=uav_a_direction, speed=uav_a_speed)
+    uav_b_traj = calc.traj_calc.create_uav_trajectory("FY2", direction_degrees=uav_b_direction, speed=uav_b_speed)
+    uav_c_traj = calc.traj_calc.create_uav_trajectory("FY3", direction_degrees=uav_c_direction, speed=uav_c_speed)
+    
+    # 创建三个烟幕云轨迹（每架无人机投放一个烟幕弹）
+    smoke_a_traj = calc.traj_calc.create_smoke_trajectory(uav_a_traj, smoke_a_deploy_time, smoke_a_explode_delay)
+    smoke_b_traj = calc.traj_calc.create_smoke_trajectory(uav_b_traj, smoke_b_deploy_time, smoke_b_explode_delay)
+    smoke_c_traj = calc.traj_calc.create_smoke_trajectory(uav_c_traj, smoke_c_deploy_time, smoke_c_explode_delay)
+    
+    # 创建多烟幕弹轨迹函数（返回所有活跃烟幕弹位置）
+    def multi_smoke_trajectory(t: float) -> List[Vector3]:
+        """返回当前时刻所有活跃烟幕弹的位置列表"""
+        active_smoke_positions = []
+        
+        # 检查烟幕弹A是否活跃
+        if t >= smoke_a_deploy_time + smoke_a_explode_delay:
+            active_smoke_positions.append(smoke_a_traj(t))
+        
+        # 检查烟幕弹B是否活跃
+        if t >= smoke_b_deploy_time + smoke_b_explode_delay:
+            active_smoke_positions.append(smoke_b_traj(t))
+        
+        # 检查烟幕弹C是否活跃
+        if t >= smoke_c_deploy_time + smoke_c_explode_delay:
+            active_smoke_positions.append(smoke_c_traj(t))
+        
+        return active_smoke_positions
+    
+    # 计算最早起爆时间作为开始时间
+    earliest_explode = min(
+        smoke_a_deploy_time + smoke_a_explode_delay,
+        smoke_b_deploy_time + smoke_b_explode_delay,
+        smoke_c_deploy_time + smoke_c_explode_delay
+    )
+    
+    # 获取时间边界
+    _, end_time = calc.traj_calc.get_trajectory_bounds(missile_traj, calc.max_time)
+    
+    # 使用 find_full_cover_intervals 计算联合遮挡时间区间
+    intervals = find_full_cover_intervals(
+        traj0_fn=missile_traj,                    # 导弹轨迹
+        traj1_fn=multi_smoke_trajectory,          # 多烟幕弹轨迹
+        t_min=earliest_explode,                   # 开始时间
+        t_max=end_time,                           # 结束时间
+        step=calc.time_step,                      # 时间步长
+        sphere_radius_for_cone=calc.threshold     # 烟幕云半径
+    )
+    
+    # 计算总遮蔽时长
+    total_duration = sum(b - a for a, b in intervals)
+    return total_duration
+
+
 # 所有计算函数已在上面定义完成
