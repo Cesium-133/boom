@@ -347,6 +347,191 @@ def find_t_intervals(
     return intervals
 
 
+def find_t_intervals_adaptive(
+    predicate: Callable[[float, float], bool],
+    threshold: float,
+    t_start: float,
+    t_end: float,
+    initial_step: float = 0.1,
+    min_step: float = 0.001,
+    max_step: float = 1.0,
+    tolerance: float = 1e-6
+) -> List[Tuple[float, float]]:
+    """
+    自适应步长算法：寻找满足 predicate(t, threshold) 的所有 t 区间
+    
+    核心思想：
+    1. 在平稳区域使用大步长快速扫描
+    2. 在变化区域使用小步长精确定位
+    3. 动态调整步长以平衡精度和效率
+    
+    Args:
+        predicate: 判定函数
+        threshold: 阈值
+        t_start: 开始时间
+        t_end: 结束时间
+        initial_step: 初始步长
+        min_step: 最小步长
+        max_step: 最大步长
+        tolerance: 收敛容差
+    
+    Returns:
+        时间区间列表
+    """
+    intervals: List[Tuple[float, float]] = []
+    t = t_start
+    step = initial_step
+    prev_in = predicate(t, threshold)
+    seg_start: float | None = t if prev_in else None
+    
+    # 统计信息
+    total_evaluations = 1
+    step_adjustments = 0
+    
+    while t < t_end:
+        # 确保不超过结束时间
+        next_t = min(t + step, t_end)
+        cur_in = predicate(next_t, threshold)
+        total_evaluations += 1
+        
+        # 检测状态变化
+        if prev_in != cur_in:
+            # 发现状态变化，需要精确定位边界
+            boundary = refine_boundary(predicate, t, next_t, threshold)
+            total_evaluations += 25  # refine_boundary 大约需要25次评估
+            
+            if prev_in and not cur_in:
+                # 从True变为False，结束一个区间
+                if seg_start is not None:
+                    intervals.append((seg_start, boundary))
+                    seg_start = None
+            elif (not prev_in) and cur_in:
+                # 从False变为True，开始一个新区间
+                seg_start = boundary
+            
+            # 在状态变化后减小步长，提高精度
+            step = max(min_step, step * 0.5)
+            step_adjustments += 1
+            
+        else:
+            # 状态未变化，可以适当增大步长
+            if step < max_step:
+                # 检查是否可以安全增大步长
+                # 通过中点采样来验证
+                mid_t = t + step * 0.5
+                if mid_t < t_end:
+                    mid_in = predicate(mid_t, threshold)
+                    total_evaluations += 1
+                    
+                    if mid_in == prev_in:
+                        # 中点状态一致，可以增大步长
+                        step = min(max_step, step * 1.5)
+                        step_adjustments += 1
+        
+        # 更新状态
+        t = next_t
+        prev_in = cur_in
+        
+        # 防止无限循环
+        if step < min_step:
+            step = min_step
+    
+    # 处理最后一个区间
+    if prev_in and seg_start is not None:
+        intervals.append((seg_start, t_end))
+    
+    # 可选：打印统计信息（调试用）
+    if False:  # 设为True可查看性能统计
+        print(f"自适应算法统计:")
+        print(f"  总评估次数: {total_evaluations}")
+        print(f"  步长调整次数: {step_adjustments}")
+        print(f"  平均步长: {(t_end - t_start) / max(1, total_evaluations - 25 * len(intervals)):.4f}")
+    
+    return intervals
+
+
+def find_t_intervals_smart(
+    predicate: Callable[[float, float], bool],
+    threshold: float,
+    t_start: float,
+    t_end: float,
+    initial_step: float = 0.1,
+    aggressive_speedup: bool = True
+) -> List[Tuple[float, float]]:
+    """
+    智能自适应步长算法 - 针对烟幕遮蔽问题优化
+    
+    基于以下观察优化：
+    1. 烟幕遮蔽通常有明确的开始和结束时间
+    2. 遮蔽区间内部通常状态稳定
+    3. 可以利用物理约束预测状态变化
+    
+    Args:
+        predicate: 判定函数
+        threshold: 阈值
+        t_start: 开始时间
+        t_end: 结束时间
+        initial_step: 初始步长
+        aggressive_speedup: 是否启用激进的加速策略
+    
+    Returns:
+        时间区间列表
+    """
+    intervals: List[Tuple[float, float]] = []
+    t = t_start
+    step = initial_step
+    prev_in = predicate(t, threshold)
+    seg_start: float | None = t if prev_in else None
+    
+    # 连续相同状态的计数，用于动态调整步长
+    same_state_count = 0
+    total_evaluations = 1
+    
+    while t < t_end:
+        next_t = min(t + step, t_end)
+        cur_in = predicate(next_t, threshold)
+        total_evaluations += 1
+        
+        if prev_in == cur_in:
+            # 状态未变化
+            same_state_count += 1
+            
+            # 激进加速策略：连续相同状态时快速增大步长
+            if aggressive_speedup and same_state_count > 3:
+                step = min(step * 2.0, (t_end - t) / 10)  # 最大不超过剩余时间的1/10
+            elif same_state_count > 5:
+                step = min(step * 1.5, 1.0)
+                
+        else:
+            # 状态发生变化
+            same_state_count = 0
+            
+            # 精确定位边界
+            boundary = refine_boundary(predicate, t, next_t, threshold)
+            total_evaluations += 25
+            
+            if prev_in and not cur_in:
+                # 结束区间
+                if seg_start is not None:
+                    intervals.append((seg_start, boundary))
+                    seg_start = None
+            elif (not prev_in) and cur_in:
+                # 开始区间
+                seg_start = boundary
+            
+            # 在状态变化后重置步长
+            step = initial_step
+        
+        t = next_t
+        prev_in = cur_in
+    
+    # 处理最后一个区间
+    if prev_in and seg_start is not None:
+        intervals.append((seg_start, t_end))
+    
+    return intervals
+
+
 @lru_cache(maxsize=360)
 def direction_to_unit_vector(direction_degrees: float) -> Tuple[float, float]:
     """

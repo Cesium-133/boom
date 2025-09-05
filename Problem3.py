@@ -4,9 +4,16 @@
 改进特性：
 1. 基于Problem2-PSO-Enhanced.py的框架
 2. 支持两种遮蔽计算模式：独立遮蔽 vs 联合遮蔽
-3. 优化7个决策变量：无人机参数 + 3个烟幕弹的时间参数
+3. 优化8个决策变量：无人机参数 + 3个烟幕弹的时间参数
 4. 自适应多种群并行搜索
 5. 动态参数调整和重启机制
+6. 自适应步长区间查找算法 (NEW)
+
+核心优化：
+- 使用Numba JIT编译加速核心几何计算
+- 采用自适应步长算法优化时间区间查找
+- LRU缓存减少重复计算
+- 多烟幕弹协同遮蔽效应建模
 
 目标：找到最优的无人机速度、飞行方向和3个烟幕弹的投放时间、引信延时，
 使得有效遮蔽时长最大化。
@@ -50,11 +57,11 @@ class Particle:
 
 # 全局函数，用于并行计算
 def evaluate_particle_fitness_independent(particle_data):
-    """评估粒子适应度的全局函数 - 独立遮蔽模式"""
+    """评估粒子适应度的全局函数 - 独立遮蔽模式 (自适应步长)"""
     position, bounds_list = particle_data
     
     try:
-        # 解码位置 - 7个决策变量
+        # 解码位置 - 8个决策变量
         params = {
             'v_FY1': position[0],           # 无人机速度
             'theta_FY1': position[1],       # 无人机方向
@@ -66,7 +73,7 @@ def evaluate_particle_fitness_independent(particle_data):
             'smoke_c_explode_delay': position[7]    # 烟幕弹C引信延时
         }
         
-        # 计算适应度 - 使用独立遮蔽模式
+        # 计算适应度 - 使用独立遮蔽模式 + 自适应步长算法
         duration = calculate_single_uav_triple_smoke_masking(
             uav_direction=params['theta_FY1'],
             uav_speed=params['v_FY1'],
@@ -75,7 +82,8 @@ def evaluate_particle_fitness_independent(particle_data):
             smoke_b_deploy_delay=params['smoke_b_deploy_delay'],
             smoke_b_explode_delay=params['smoke_b_explode_delay'],
             smoke_c_deploy_delay=params['smoke_c_deploy_delay'],
-            smoke_c_explode_delay=params['smoke_c_explode_delay']
+            smoke_c_explode_delay=params['smoke_c_explode_delay'],
+            algorithm="adaptive"  # 使用自适应步长算法
         )
         
         return duration
@@ -86,14 +94,14 @@ def evaluate_particle_fitness_independent(particle_data):
 
 
 def evaluate_particle_fitness_multiple(particle_data):
-    """评估粒子适应度的全局函数 - 联合遮蔽模式"""
+    """评估粒子适应度的全局函数 - 联合遮蔽模式 (自适应步长)"""
     if not HAS_MULTIPLE_MASKING:
         return evaluate_particle_fitness_independent(particle_data)
     
     position, bounds_list = particle_data
     
     try:
-        # 解码位置 - 7个决策变量
+        # 解码位置 - 8个决策变量
         params = {
             'v_FY1': position[0],           # 无人机速度
             'theta_FY1': position[1],       # 无人机方向
@@ -105,7 +113,7 @@ def evaluate_particle_fitness_multiple(particle_data):
             'smoke_c_explode_delay': position[7]    # 烟幕弹C引信延时
         }
         
-        # 计算适应度 - 使用联合遮蔽模式
+        # 计算适应度 - 使用联合遮蔽模式 + 自适应步长算法
         duration = calculate_single_uav_triple_smoke_masking_multiple(
             uav_direction=params['theta_FY1'],
             uav_speed=params['v_FY1'],
@@ -114,7 +122,8 @@ def evaluate_particle_fitness_multiple(particle_data):
             smoke_b_deploy_delay=params['smoke_b_deploy_delay'],
             smoke_b_explode_delay=params['smoke_b_explode_delay'],
             smoke_c_deploy_delay=params['smoke_c_deploy_delay'],
-            smoke_c_explode_delay=params['smoke_c_explode_delay']
+            smoke_c_explode_delay=params['smoke_c_explode_delay'],
+            algorithm="adaptive"  # 使用自适应步长算法
         )
         
         return duration
@@ -142,7 +151,7 @@ def calculate_bounds():
     
     print(f"导弹到达虚假目标时间: {t_max:.2f}s")
     
-    # 7个决策变量的边界
+    # 8个决策变量的边界
     bounds = {
         'v_FY1': (70.0, 140.0),              # 无人机速度
         'theta_FY1': (0.0, 360.0),           # 无人机方向
@@ -608,7 +617,8 @@ def analyze_problem3_results(best_position: np.ndarray, best_fitness: float,
             smoke_b_deploy_delay=best_params['smoke_b_deploy_delay'],
             smoke_b_explode_delay=best_params['smoke_b_explode_delay'],
             smoke_c_deploy_delay=best_params['smoke_c_deploy_delay'],
-            smoke_c_explode_delay=best_params['smoke_c_explode_delay']
+            smoke_c_explode_delay=best_params['smoke_c_explode_delay'],
+            algorithm="adaptive"  # 使用自适应步长算法验证
         )
     else:
         verification_result = calculate_single_uav_triple_smoke_masking(
@@ -619,7 +629,8 @@ def analyze_problem3_results(best_position: np.ndarray, best_fitness: float,
             smoke_b_deploy_delay=best_params['smoke_b_deploy_delay'],
             smoke_b_explode_delay=best_params['smoke_b_explode_delay'],
             smoke_c_deploy_delay=best_params['smoke_c_deploy_delay'],
-            smoke_c_explode_delay=best_params['smoke_c_explode_delay']
+            smoke_c_explode_delay=best_params['smoke_c_explode_delay'],
+            algorithm="adaptive"  # 使用自适应步长算法验证
         )
     print(f"验证结果: {verification_result:.6f} 秒")
     

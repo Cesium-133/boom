@@ -24,7 +24,8 @@ except ImportError:
 from .config import CONSTANTS, TARGETS, CALCULATION_PARAMS, SMOKE_PARAMS
 from .geometry import (
     Vector3, distance_between, get_top_plane_points, get_under_points,
-    feet_of_perpendicular_to_anchor_target_lines, find_t_intervals
+    feet_of_perpendicular_to_anchor_target_lines, find_t_intervals,
+    find_t_intervals_adaptive, find_t_intervals_smart
 )
 from .trajectory import TrajectoryCalculator
 
@@ -169,7 +170,8 @@ class MaskingCalculator:
         missile_traj: Callable[[float], Vector3],
         smoke_traj: Callable[[float], Vector3],
         start_time: float = 0.0,
-        end_time: float = None
+        end_time: float = None,
+        algorithm: str = "adaptive"  # "fixed", "adaptive", "smart"
     ) -> float:
         """
         计算有效遮蔽时长
@@ -179,6 +181,7 @@ class MaskingCalculator:
             smoke_traj: 烟幕云轨迹函数
             start_time: 开始时间
             end_time: 结束时间（如果为None则自动计算）
+            algorithm: 区间查找算法 ("fixed", "adaptive", "smart")
             
         Returns:
             有效遮蔽时长（秒）
@@ -190,14 +193,36 @@ class MaskingCalculator:
         # 创建遮蔽判定函数
         predicate = self._create_masking_predicate(missile_traj, smoke_traj)
         
-        # 寻找满足遮蔽条件的时间区间
-        intervals = find_t_intervals(
-            predicate, 
-            self.threshold, 
-            start_time, 
-            end_time, 
-            self.time_step
-        )
+        # 根据算法选择寻找满足遮蔽条件的时间区间
+        if algorithm == "fixed":
+            intervals = find_t_intervals(
+                predicate, 
+                self.threshold, 
+                start_time, 
+                end_time, 
+                self.time_step
+            )
+        elif algorithm == "adaptive":
+            intervals = find_t_intervals_adaptive(
+                predicate,
+                self.threshold,
+                start_time,
+                end_time,
+                initial_step=self.time_step * 10,  # 开始时使用较大步长
+                min_step=self.time_step / 2,      # 最小步长为原来的一半
+                max_step=self.time_step * 50      # 最大步长
+            )
+        elif algorithm == "smart":
+            intervals = find_t_intervals_smart(
+                predicate,
+                self.threshold,
+                start_time,
+                end_time,
+                initial_step=self.time_step * 5,  # 智能算法的初始步长
+                aggressive_speedup=True
+            )
+        else:
+            raise ValueError(f"Unknown algorithm: {algorithm}")
         
         # 计算总遮蔽时长
         total_duration = sum(b - a for a, b in intervals)
@@ -209,7 +234,8 @@ def calculate_single_uav_single_smoke_masking(
     uav_direction: float,
     uav_speed: float,
     smoke_deploy_time: float,
-    smoke_explode_delay: float
+    smoke_explode_delay: float,
+    algorithm: str = "adaptive"  # "fixed", "adaptive", "smart"
 ) -> float:
     """
     计算单无人机单烟幕弹单导弹的有效遮蔽时长
@@ -219,6 +245,7 @@ def calculate_single_uav_single_smoke_masking(
         uav_speed: 无人机飞行速度（m/s）
         smoke_deploy_time: 烟幕弹投放时间（s）
         smoke_explode_delay: 烟幕弹起爆相对延时（s）
+        algorithm: 区间查找算法 ("fixed", "adaptive", "smart")
         
     Returns:
         有效遮蔽时长（s）
@@ -234,9 +261,13 @@ def calculate_single_uav_single_smoke_masking(
     # 创建烟幕云轨迹
     smoke_traj = calc.traj_calc.create_smoke_trajectory(uav_traj, smoke_deploy_time, smoke_explode_delay)
     
-    # 计算遮蔽时长
+    # 计算遮蔽时长，使用指定的算法
     explode_time = smoke_deploy_time + smoke_explode_delay
-    duration = calc.calculate_masking_duration(missile_traj, smoke_traj, start_time=explode_time)
+    duration = calc.calculate_masking_duration(
+        missile_traj, smoke_traj, 
+        start_time=explode_time,
+        algorithm=algorithm
+    )
     
     return duration
 
@@ -249,7 +280,8 @@ def calculate_single_uav_triple_smoke_masking(
     smoke_b_deploy_delay: float,
     smoke_b_explode_delay: float,
     smoke_c_deploy_delay: float,
-    smoke_c_explode_delay: float
+    smoke_c_explode_delay: float,
+    algorithm: str = "adaptive"  # "fixed", "adaptive", "smart"
 ) -> float:
     """
     计算单无人机3烟幕弹单导弹的有效遮蔽时长
@@ -263,6 +295,7 @@ def calculate_single_uav_triple_smoke_masking(
         smoke_b_explode_delay: 烟幕弹B起爆延时（s）
         smoke_c_deploy_delay: 烟幕弹C相对B的投放延时（s）
         smoke_c_explode_delay: 烟幕弹C起爆延时（s）
+        algorithm: 区间查找算法 ("fixed", "adaptive", "smart")
         
     Returns:
         有效遮蔽时长（s）
@@ -320,15 +353,38 @@ def calculate_single_uav_triple_smoke_masking(
         smoke_c_deploy_time + smoke_c_explode_delay
     )
     
-    # 寻找满足条件的时间区间
+    # 寻找满足条件的时间区间，使用指定算法
     _, end_time = calc.traj_calc.get_trajectory_bounds(missile_traj, calc.max_time)
-    intervals = find_t_intervals(
-        combined_predicate,
-        calc.threshold,
-        earliest_explode,
-        end_time,
-        calc.time_step
-    )
+    
+    if algorithm == "fixed":
+        intervals = find_t_intervals(
+            combined_predicate,
+            calc.threshold,
+            earliest_explode,
+            end_time,
+            calc.time_step
+        )
+    elif algorithm == "adaptive":
+        intervals = find_t_intervals_adaptive(
+            combined_predicate,
+            calc.threshold,
+            earliest_explode,
+            end_time,
+            initial_step=calc.time_step * 10,
+            min_step=calc.time_step / 2,
+            max_step=calc.time_step * 50
+        )
+    elif algorithm == "smart":
+        intervals = find_t_intervals_smart(
+            combined_predicate,
+            calc.threshold,
+            earliest_explode,
+            end_time,
+            initial_step=calc.time_step * 5,
+            aggressive_speedup=True
+        )
+    else:
+        raise ValueError(f"Unknown algorithm: {algorithm}")
     
     # 计算总遮蔽时长
     total_duration = sum(b - a for a, b in intervals)
@@ -443,7 +499,8 @@ def calculate_single_uav_triple_smoke_masking_multiple(
     smoke_b_deploy_delay: float,
     smoke_b_explode_delay: float,
     smoke_c_deploy_delay: float,
-    smoke_c_explode_delay: float
+    smoke_c_explode_delay: float,
+    algorithm: str = "adaptive"  # "fixed", "adaptive", "smart"
 ) -> float:
     """
     计算单无人机3烟幕弹单导弹的有效遮蔽时长 - 联合遮挡版本
@@ -461,6 +518,7 @@ def calculate_single_uav_triple_smoke_masking_multiple(
         smoke_b_explode_delay: 烟幕弹B起爆延时（s）
         smoke_c_deploy_delay: 烟幕弹C相对B的投放延时（s）
         smoke_c_explode_delay: 烟幕弹C起爆延时（s）
+        algorithm: 区间查找算法 ("fixed", "adaptive", "smart")
         
     Returns:
         有效遮蔽时长（s）
@@ -571,15 +629,38 @@ def calculate_single_uav_triple_smoke_masking_multiple(
         smoke_c_deploy_time + smoke_c_explode_delay
     )
     
-    # 寻找满足条件的时间区间
+    # 寻找满足条件的时间区间，使用指定算法
     _, end_time = calc.traj_calc.get_trajectory_bounds(missile_traj, calc.max_time)
-    intervals = find_t_intervals(
-        multiple_smoke_predicate,
-        calc.threshold,
-        earliest_explode,
-        end_time,
-        calc.time_step
-    )
+    
+    if algorithm == "fixed":
+        intervals = find_t_intervals(
+            multiple_smoke_predicate,
+            calc.threshold,
+            earliest_explode,
+            end_time,
+            calc.time_step
+        )
+    elif algorithm == "adaptive":
+        intervals = find_t_intervals_adaptive(
+            multiple_smoke_predicate,
+            calc.threshold,
+            earliest_explode,
+            end_time,
+            initial_step=calc.time_step * 10,
+            min_step=calc.time_step / 2,
+            max_step=calc.time_step * 50
+        )
+    elif algorithm == "smart":
+        intervals = find_t_intervals_smart(
+            multiple_smoke_predicate,
+            calc.threshold,
+            earliest_explode,
+            end_time,
+            initial_step=calc.time_step * 5,
+            aggressive_speedup=True
+        )
+    else:
+        raise ValueError(f"Unknown algorithm: {algorithm}")
     
     # 计算总遮蔽时长
     total_duration = sum(b - a for a, b in intervals)

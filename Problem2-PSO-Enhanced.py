@@ -8,6 +8,12 @@
 4. 重启机制
 5. 局部搜索增强
 6. 并行计算加速
+7. 自适应步长区间查找算法 (NEW)
+
+核心优化：
+- 使用Numba JIT编译加速核心几何计算
+- 采用自适应步长算法优化时间区间查找
+- LRU缓存减少重复计算
 
 目标：找到最优的无人机速度、飞行方向、烟幕弹投放时间和引信延时，
 使得有效遮蔽时长最大化（理论最优值约4.8秒）。
@@ -45,7 +51,7 @@ class Particle:
 
 # 全局函数，用于并行计算
 def evaluate_particle_fitness(particle_data):
-    """评估粒子适应度的全局函数"""
+    """评估粒子适应度的全局函数 - 使用自适应步长算法"""
     position, bounds_list = particle_data
     
     try:
@@ -57,12 +63,13 @@ def evaluate_particle_fitness(particle_data):
             't_fuse': position[3]
         }
         
-        # 计算适应度
+        # 计算适应度 - 使用自适应步长算法
         duration = calculate_single_uav_single_smoke_masking(
             uav_direction=params['theta_FY1'],
             uav_speed=params['v_FY1'],
             smoke_deploy_time=params['t_deploy'],
-            smoke_explode_delay=params['t_fuse']
+            smoke_explode_delay=params['t_fuse'],
+            algorithm="adaptive"  # 使用自适应步长算法
         )
         
         return duration
