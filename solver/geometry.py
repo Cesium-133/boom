@@ -12,10 +12,146 @@
 from __future__ import annotations
 from typing import List, Tuple, Callable
 from math import sqrt, cos, sin, radians
+from functools import lru_cache
+import numpy as np
+
+# 尝试导入Numba，如果不可用则使用标准实现
+try:
+    from numba import jit
+    HAS_NUMBA = True
+except ImportError:
+    HAS_NUMBA = False
+    # 定义空的装饰器
+    def jit(*args, **kwargs):
+        def decorator(func):
+            return func
+        return decorator
 
 Vector3 = Tuple[float, float, float]
 
+# =============================================================================
+# Numba优化的核心计算函数
+# =============================================================================
 
+if HAS_NUMBA:
+    @jit(nopython=True, cache=True, fastmath=True)
+    def _distance_between_numba(x0: float, y0: float, z0: float, 
+                               x1: float, y1: float, z1: float) -> float:
+        """计算两点间的欧氏距离 - Numba优化版本"""
+        dx = x1 - x0
+        dy = y1 - y0
+        dz = z1 - z0
+        return sqrt(dx * dx + dy * dy + dz * dz)
+
+    @jit(nopython=True, cache=True, fastmath=True)
+    def _foot_of_perpendicular_numba(px: float, py: float, pz: float,
+                                    sx: float, sy: float, sz: float,
+                                    ex: float, ey: float, ez: float):
+        """计算点到线段的垂足坐标 - Numba优化版本"""
+        seg_x = ex - sx
+        seg_y = ey - sy
+        seg_z = ez - sz
+        
+        segment_length_sq = seg_x * seg_x + seg_y * seg_y + seg_z * seg_z
+        
+        if segment_length_sq == 0.0:
+            return (sx, sy, sz)
+        
+        to_x = px - sx
+        to_y = py - sy
+        to_z = pz - sz
+        
+        t = (to_x * seg_x + to_y * seg_y + to_z * seg_z) / segment_length_sq
+        t = max(0.0, min(1.0, t))
+        
+        foot_x = sx + t * seg_x
+        foot_y = sy + t * seg_y
+        foot_z = sz + t * seg_z
+        
+        return (foot_x, foot_y, foot_z)
+
+    @jit(nopython=True, cache=True, fastmath=True)
+    def _get_circle_points_numba(center_x: float, center_y: float, center_z: float,
+                                missile_x: float, missile_y: float, missile_z: float,
+                                radius: float, is_top: bool):
+        """获取圆上的三个关键点 - Numba优化版本"""
+        if is_top:
+            # 上层：center到missile的方向
+            dx = missile_x - center_x
+            dy = missile_y - center_y
+        else:
+            # 下层：missile到center的方向
+            dx = center_x - missile_x
+            dy = center_y - missile_y
+        
+        # 单位化xy投影向量
+        xy_norm = sqrt(dx * dx + dy * dy)
+        if xy_norm < 1e-10:
+            ux, uy = 1.0, 0.0
+        else:
+            ux, uy = dx / xy_norm, dy / xy_norm
+        
+        # 垂直向量（逆时针90度）
+        vx, vy = -uy, ux
+        
+        # 三个点的坐标
+        points_x = np.array([
+            center_x + radius * ux,
+            center_x + radius * vx,
+            center_x - radius * vx
+        ])
+        points_y = np.array([
+            center_y + radius * uy,
+            center_y + radius * vy,
+            center_y - radius * vy
+        ])
+        points_z = np.array([center_z, center_z, center_z])
+        
+        return points_x, points_y, points_z
+else:
+    # 标准Python实现作为后备
+    def _distance_between_numba(x0, y0, z0, x1, y1, z1):
+        dx, dy, dz = x1 - x0, y1 - y0, z1 - z0
+        return sqrt(dx * dx + dy * dy + dz * dz)
+    
+    def _foot_of_perpendicular_numba(px, py, pz, sx, sy, sz, ex, ey, ez):
+        seg_x, seg_y, seg_z = ex - sx, ey - sy, ez - sz
+        segment_length_sq = seg_x * seg_x + seg_y * seg_y + seg_z * seg_z
+        
+        if segment_length_sq == 0.0:
+            return (sx, sy, sz)
+        
+        to_x, to_y, to_z = px - sx, py - sy, pz - sz
+        t = (to_x * seg_x + to_y * seg_y + to_z * seg_z) / segment_length_sq
+        t = max(0.0, min(1.0, t))
+        
+        return (sx + t * seg_x, sy + t * seg_y, sz + t * seg_z)
+    
+    def _get_circle_points_numba(center_x, center_y, center_z, missile_x, missile_y, missile_z, radius, is_top):
+        if is_top:
+            dx, dy = missile_x - center_x, missile_y - center_y
+        else:
+            dx, dy = center_x - missile_x, center_y - missile_y
+        
+        xy_norm = sqrt(dx * dx + dy * dy)
+        if xy_norm < 1e-10:
+            ux, uy = 1.0, 0.0
+        else:
+            ux, uy = dx / xy_norm, dy / xy_norm
+        
+        vx, vy = -uy, ux
+        
+        points_x = np.array([center_x + radius * ux, center_x + radius * vx, center_x - radius * vx])
+        points_y = np.array([center_y + radius * uy, center_y + radius * vy, center_y - radius * vy])
+        points_z = np.array([center_z, center_z, center_z])
+        
+        return points_x, points_y, points_z
+
+# =============================================================================
+# 优化后的公共接口函数
+# =============================================================================
+
+@lru_cache(maxsize=1000)
 def distance_to_origin(point: Vector3) -> float:
     """计算点到原点 (0,0,0) 的距离"""
     if len(point) != 3:
@@ -27,12 +163,10 @@ def distance_between(p0: Vector3, p1: Vector3) -> float:
     """计算两点间的欧氏距离"""
     if len(p0) != 3 or len(p1) != 3:
         raise ValueError("p0 与 p1 必须是长度为 3 的三元组")
-    dx = p1[0] - p0[0]
-    dy = p1[1] - p0[1] 
-    dz = p1[2] - p0[2]
-    return sqrt(dx * dx + dy * dy + dz * dz)
+    return _distance_between_numba(p0[0], p0[1], p0[2], p1[0], p1[1], p1[2])
 
 
+@lru_cache(maxsize=1000)
 def distance_point_to_line(point: Vector3, line_point: Vector3, line_direction: Vector3) -> float:
     """
     计算点到直线最短距离
@@ -63,11 +197,13 @@ def distance_point_to_line(point: Vector3, line_point: Vector3, line_direction: 
     return c_norm / v_norm
 
 
+@lru_cache(maxsize=500)
 def subtract(a: Vector3, b: Vector3) -> Vector3:
     """计算向量 a - b"""
     return (a[0] - b[0], a[1] - b[1], a[2] - b[2])
 
 
+@lru_cache(maxsize=500)
 def dot(a: Vector3, b: Vector3) -> float:
     """计算向量 a 和 b 的点积"""
     return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
@@ -85,31 +221,11 @@ def foot_of_perpendicular_on_segment(point: Vector3, segment_start: Vector3, seg
     Returns:
         垂足坐标（如果垂足在线段外，则返回线段上最近的点）
     """
-    # 线段方向向量
-    segment_vec = subtract(segment_end, segment_start)
-    segment_length_sq = dot(segment_vec, segment_vec)
-    
-    # 如果线段长度为0，返回起点
-    if segment_length_sq == 0:
-        return segment_start
-    
-    # 从线段起点到目标点的向量
-    to_point = subtract(point, segment_start)
-    
-    # 计算投影参数 t
-    t = dot(to_point, segment_vec) / segment_length_sq
-    
-    # 将 t 限制在 [0, 1] 范围内，确保垂足在线段上
-    t = max(0.0, min(1.0, t))
-    
-    # 计算垂足坐标
-    foot = (
-        segment_start[0] + t * segment_vec[0],
-        segment_start[1] + t * segment_vec[1],
-        segment_start[2] + t * segment_vec[2]
+    return _foot_of_perpendicular_numba(
+        point[0], point[1], point[2],
+        segment_start[0], segment_start[1], segment_start[2],
+        segment_end[0], segment_end[1], segment_end[2]
     )
-    
-    return foot
 
 
 def feet_of_perpendicular_to_anchor_target_lines(
@@ -137,76 +253,22 @@ def feet_of_perpendicular_to_anchor_target_lines(
 
 def get_top_plane_points(traj0_pos: Vector3, center: Vector3, radius: float = 7.0) -> List[Vector3]:
     """在 xy 平面上，以 center 为圆心、radius 为半径的圆上，计算与 traj0-center 连线垂直的三个点（基于cyx实现）"""
-    # center 到 traj0 的向量在 xy 平面的投影
-    dx = - center[0] + traj0_pos[0]
-    dy = - center[1] + traj0_pos[1]
-    
-    # 单位化 xy 投影向量
-    xy_norm = (dx * dx + dy * dy) ** 0.5
-    if xy_norm < 1e-10:
-        # 如果 traj0 和 center 在 xy 平面重合，使用默认方向
-        ux, uy = 1.0, 0.0
-    else:
-        ux, uy = dx / xy_norm, dy / xy_norm
-    
-    # 垂直向量（逆时针90度）
-    vx, vy = -uy, ux
-    
-    # 三个点：沿连线方向、垂直方向、-垂直方向
-    points = []
-    # 点1：沿连线方向（从 center 指向 traj0 的方向）
-    px1 = center[0] + radius * ux
-    py1 = center[1] + radius * uy
-    points.append((px1, py1, center[2]))
-    
-    # 点2：沿垂直方向
-    px2 = center[0] + radius * vx
-    py2 = center[1] + radius * vy
-    points.append((px2, py2, center[2]))
-    
-    # 点3：沿-垂直方向
-    px3 = center[0] - radius * vx
-    py3 = center[1] - radius * vy
-    points.append((px3, py3, center[2]))
-    
-    return points
+    points_x, points_y, points_z = _get_circle_points_numba(
+        center[0], center[1], center[2],
+        traj0_pos[0], traj0_pos[1], traj0_pos[2],
+        radius, True  # is_top = True
+    )
+    return [(points_x[i], points_y[i], points_z[i]) for i in range(3)]
 
 
 def get_under_points(traj0_pos: Vector3, center: Vector3, radius: float = 7.0) -> List[Vector3]:
     """在 xy 平面上，以 center 为圆心、radius 为半径的圆上，计算与 traj0-center 连线垂直的三个点（基于cyx实现）"""
-    # center 到 traj0 的向量在 xy 平面的投影
-    dx = center[0] - traj0_pos[0]
-    dy = center[1] - traj0_pos[1]
-    
-    # 单位化 xy 投影向量
-    xy_norm = (dx * dx + dy * dy) ** 0.5
-    if xy_norm < 1e-10:
-        # 如果 traj0 和 center 在 xy 平面重合，使用默认方向
-        ux, uy = 1.0, 0.0
-    else:
-        ux, uy = dx / xy_norm, dy / xy_norm
-    
-    # 垂直向量（逆时针90度）
-    vx, vy = -uy, ux
-    
-    # 三个点：沿连线方向、垂直方向、-垂直方向
-    points = []
-    # 点1：沿连线方向（从 center 指向 traj0 的方向）
-    px1 = center[0] + radius * ux
-    py1 = center[1] + radius * uy
-    points.append((px1, py1, center[2]))
-    
-    # 点2：沿垂直方向
-    px2 = center[0] + radius * vx
-    py2 = center[1] + radius * vy
-    points.append((px2, py2, center[2]))
-    
-    # 点3：沿-垂直方向
-    px3 = center[0] - radius * vx
-    py3 = center[1] - radius * vy
-    points.append((px3, py3, center[2]))
-    
-    return points
+    points_x, points_y, points_z = _get_circle_points_numba(
+        center[0], center[1], center[2],
+        traj0_pos[0], traj0_pos[1], traj0_pos[2],
+        radius, False  # is_top = False
+    )
+    return [(points_x[i], points_y[i], points_z[i]) for i in range(3)]
 
 
 def get_target_points(missile_pos: Vector3, center: Vector3, radius: float = 7.0) -> List[Vector3]:
@@ -224,6 +286,7 @@ def get_target_points(missile_pos: Vector3, center: Vector3, radius: float = 7.0
     return get_top_plane_points(missile_pos, center, radius)
 
 
+@lru_cache(maxsize=100)
 def refine_boundary(
     predicate: Callable[[float, float], bool],
     t_lo: float,
@@ -284,6 +347,7 @@ def find_t_intervals(
     return intervals
 
 
+@lru_cache(maxsize=360)
 def direction_to_unit_vector(direction_degrees: float) -> Tuple[float, float]:
     """
     将角度（度）转换为xy平面单位方向向量

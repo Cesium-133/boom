@@ -7,12 +7,97 @@
 
 from __future__ import annotations
 from typing import List, Tuple, Callable
+from functools import lru_cache
+import numpy as np
+
+# 尝试导入Numba，如果不可用则使用标准实现
+try:
+    from numba import jit
+    HAS_NUMBA = True
+except ImportError:
+    HAS_NUMBA = False
+    def jit(*args, **kwargs):
+        def decorator(func):
+            return func
+        return decorator
+
 from .config import CONSTANTS, TARGETS, CALCULATION_PARAMS, SMOKE_PARAMS
 from .geometry import (
     Vector3, distance_between, get_top_plane_points, get_under_points,
     feet_of_perpendicular_to_anchor_target_lines, find_t_intervals
 )
 from .trajectory import TrajectoryCalculator
+
+# =============================================================================
+# Numba优化的核心计算函数
+# =============================================================================
+
+if HAS_NUMBA:
+    @jit(nopython=True, cache=True, fastmath=True)
+    def _compute_max_distance_to_lines_numba(smoke_x: float, smoke_y: float, smoke_z: float,
+                                           missile_x: float, missile_y: float, missile_z: float,
+                                           target_points_x: np.ndarray, 
+                                           target_points_y: np.ndarray, 
+                                           target_points_z: np.ndarray) -> float:
+        """
+        计算烟幕云到所有视线的最大距离 - Numba优化版本
+        这是性能瓶颈函数，需要重点优化
+        """
+        max_distance = 0.0
+        n_points = len(target_points_x)
+        
+        for i in range(n_points):
+            # 计算线段方向向量
+            seg_x = target_points_x[i] - missile_x
+            seg_y = target_points_y[i] - missile_y
+            seg_z = target_points_z[i] - missile_z
+            
+            segment_length_sq = seg_x * seg_x + seg_y * seg_y + seg_z * seg_z
+            
+            if segment_length_sq == 0.0:
+                # 如果目标点与导弹重合，直接计算距离
+                dist = ((smoke_x - missile_x)**2 + (smoke_y - missile_y)**2 + (smoke_z - missile_z)**2)**0.5
+            else:
+                # 计算垂足
+                to_x = smoke_x - missile_x
+                to_y = smoke_y - missile_y
+                to_z = smoke_z - missile_z
+                
+                t = (to_x * seg_x + to_y * seg_y + to_z * seg_z) / segment_length_sq
+                t = max(0.0, min(1.0, t))
+                
+                foot_x = missile_x + t * seg_x
+                foot_y = missile_y + t * seg_y
+                foot_z = missile_z + t * seg_z
+                
+                # 计算距离
+                dist = ((smoke_x - foot_x)**2 + (smoke_y - foot_y)**2 + (smoke_z - foot_z)**2)**0.5
+            
+            if dist > max_distance:
+                max_distance = dist
+        
+        return max_distance
+else:
+    def _compute_max_distance_to_lines_numba(smoke_x, smoke_y, smoke_z, missile_x, missile_y, missile_z,
+                                           target_points_x, target_points_y, target_points_z):
+        max_distance = 0.0
+        n_points = len(target_points_x)
+        
+        for i in range(n_points):
+            seg_x, seg_y, seg_z = target_points_x[i] - missile_x, target_points_y[i] - missile_y, target_points_z[i] - missile_z
+            segment_length_sq = seg_x * seg_x + seg_y * seg_y + seg_z * seg_z
+            
+            if segment_length_sq == 0.0:
+                dist = ((smoke_x - missile_x)**2 + (smoke_y - missile_y)**2 + (smoke_z - missile_z)**2)**0.5
+            else:
+                to_x, to_y, to_z = smoke_x - missile_x, smoke_y - missile_y, smoke_z - missile_z
+                t = max(0.0, min(1.0, (to_x * seg_x + to_y * seg_y + to_z * seg_z) / segment_length_sq))
+                foot_x, foot_y, foot_z = missile_x + t * seg_x, missile_y + t * seg_y, missile_z + t * seg_z
+                dist = ((smoke_x - foot_x)**2 + (smoke_y - foot_y)**2 + (smoke_z - foot_z)**2)**0.5
+            
+            max_distance = max(max_distance, dist)
+        
+        return max_distance
 
 
 class MaskingCalculator:
@@ -24,7 +109,7 @@ class MaskingCalculator:
         self.time_step = CALCULATION_PARAMS["time_step"]
         self.max_time = CALCULATION_PARAMS["max_simulation_time"]
         
-        # 目标配置
+        # 预计算目标配置
         self.target_centers = [
             TARGETS["true_target"]["base_center"].copy(),  # 基础中心
             [TARGETS["true_target"]["base_center"][0], 
@@ -39,7 +124,7 @@ class MaskingCalculator:
         smoke_traj: Callable[[float], Vector3]
     ) -> Callable[[float, float], bool]:
         """
-        创建遮蔽判定函数
+        创建遮蔽判定函数 - 优化版本
         
         Args:
             missile_traj: 导弹轨迹函数
@@ -48,7 +133,12 @@ class MaskingCalculator:
         Returns:
             判定函数 predicate(t, threshold) -> bool
         """
-        def predicate(t: float, threshold: float) -> bool:
+        # 预计算目标中心
+        base_center = np.array(self.target_centers[0], dtype=np.float64)
+        top_center = np.array(self.target_centers[1], dtype=np.float64)
+        
+        @lru_cache(maxsize=1000)  # 缓存计算结果
+        def cached_predicate(t: float, threshold: float) -> bool:
             # 获取当前时刻的导弹和烟幕云位置
             missile_pos = missile_traj(t)
             smoke_pos = smoke_traj(t)
@@ -58,20 +148,21 @@ class MaskingCalculator:
             under_points = get_under_points(missile_pos, self.target_centers[0], self.target_radius)   # 下层
             all_target_points = top_points + under_points
             
-            # 计算烟幕云到各条视线的距离
-            feet = feet_of_perpendicular_to_anchor_target_lines(
-                smoke_pos, missile_pos, all_target_points
+            # 转换为NumPy数组以便Numba优化
+            target_points_x = np.array([p[0] for p in all_target_points], dtype=np.float64)
+            target_points_y = np.array([p[1] for p in all_target_points], dtype=np.float64)
+            target_points_z = np.array([p[2] for p in all_target_points], dtype=np.float64)
+            
+            # 使用优化版本计算最大距离
+            max_distance = _compute_max_distance_to_lines_numba(
+                smoke_pos[0], smoke_pos[1], smoke_pos[2],
+                missile_pos[0], missile_pos[1], missile_pos[2],
+                target_points_x, target_points_y, target_points_z
             )
             
-            distances = []
-            for foot in feet:
-                dist = distance_between(smoke_pos, foot)
-                distances.append(dist)
-            
-            # 判断是否所有距离都小于等于阈值
-            return max(distances) <= threshold if distances else False
+            return max_distance <= threshold
         
-        return predicate
+        return cached_predicate
     
     def calculate_masking_duration(
         self,
@@ -113,6 +204,7 @@ class MaskingCalculator:
         return total_duration
 
 
+@lru_cache(maxsize=500)
 def calculate_single_uav_single_smoke_masking(
     uav_direction: float,
     uav_speed: float,
@@ -192,7 +284,8 @@ def calculate_single_uav_triple_smoke_masking(
     smoke_b_traj = calc.traj_calc.create_smoke_trajectory(uav_traj, smoke_b_deploy_time, smoke_b_explode_delay)
     smoke_c_traj = calc.traj_calc.create_smoke_trajectory(uav_traj, smoke_c_deploy_time, smoke_c_explode_delay)
     
-    # 创建组合遮蔽判定函数
+    # 创建组合遮蔽判定函数 - 优化版本
+    @lru_cache(maxsize=1000)
     def combined_predicate(t: float, threshold: float) -> bool:
         """组合判定：任一烟幕云满足遮蔽条件即可"""
         missile_pos = missile_traj(t)
@@ -202,15 +295,20 @@ def calculate_single_uav_triple_smoke_masking(
         under_points = get_under_points(missile_pos, calc.target_centers[0], calc.target_radius)   # 下层
         all_target_points = top_points + under_points
         
+        # 转换为NumPy数组
+        target_points_x = np.array([p[0] for p in all_target_points], dtype=np.float64)
+        target_points_y = np.array([p[1] for p in all_target_points], dtype=np.float64)
+        target_points_z = np.array([p[2] for p in all_target_points], dtype=np.float64)
+        
         # 检查每个烟幕云的遮蔽效果
         for smoke_traj in [smoke_a_traj, smoke_b_traj, smoke_c_traj]:
             smoke_pos = smoke_traj(t)
-            feet = feet_of_perpendicular_to_anchor_target_lines(
-                smoke_pos, missile_pos, all_target_points
+            max_distance = _compute_max_distance_to_lines_numba(
+                smoke_pos[0], smoke_pos[1], smoke_pos[2],
+                missile_pos[0], missile_pos[1], missile_pos[2],
+                target_points_x, target_points_y, target_points_z
             )
-            
-            distances = [distance_between(smoke_pos, foot) for foot in feet]
-            if distances and max(distances) <= threshold:
+            if max_distance <= threshold:
                 return True
         
         return False
@@ -286,7 +384,8 @@ def calculate_multi_uav_single_smoke_masking(
     smoke_b_traj = calc.traj_calc.create_smoke_trajectory(uav_b_traj, smoke_b_deploy_time, smoke_b_explode_delay)
     smoke_c_traj = calc.traj_calc.create_smoke_trajectory(uav_c_traj, smoke_c_deploy_time, smoke_c_explode_delay)
     
-    # 创建组合遮蔽判定函数
+    # 创建组合遮蔽判定函数 - 优化版本
+    @lru_cache(maxsize=1000)
     def combined_predicate(t: float, threshold: float) -> bool:
         """组合判定：任一烟幕云满足遮蔽条件即可"""
         missile_pos = missile_traj(t)
@@ -296,15 +395,20 @@ def calculate_multi_uav_single_smoke_masking(
         under_points = get_under_points(missile_pos, calc.target_centers[0], calc.target_radius)   # 下层
         all_target_points = top_points + under_points
         
+        # 转换为NumPy数组
+        target_points_x = np.array([p[0] for p in all_target_points], dtype=np.float64)
+        target_points_y = np.array([p[1] for p in all_target_points], dtype=np.float64)
+        target_points_z = np.array([p[2] for p in all_target_points], dtype=np.float64)
+        
         # 检查每个烟幕云的遮蔽效果
         for smoke_traj in [smoke_a_traj, smoke_b_traj, smoke_c_traj]:
             smoke_pos = smoke_traj(t)
-            feet = feet_of_perpendicular_to_anchor_target_lines(
-                smoke_pos, missile_pos, all_target_points
+            max_distance = _compute_max_distance_to_lines_numba(
+                smoke_pos[0], smoke_pos[1], smoke_pos[2],
+                missile_pos[0], missile_pos[1], missile_pos[2],
+                target_points_x, target_points_y, target_points_z
             )
-            
-            distances = [distance_between(smoke_pos, foot) for foot in feet]
-            if distances and max(distances) <= threshold:
+            if max_distance <= threshold:
                 return True
         
         return False
@@ -368,7 +472,6 @@ def calculate_single_uav_triple_smoke_masking_multiple(
         compute_tangent_cone_to_sphere,
         project_point_to_plane
     )
-    import numpy as np
     
     # 计算绝对投放时间
     smoke_b_deploy_time = smoke_a_deploy_time + smoke_b_deploy_delay
@@ -388,6 +491,7 @@ def calculate_single_uav_triple_smoke_masking_multiple(
     smoke_c_traj = calc.traj_calc.create_smoke_trajectory(uav_traj, smoke_c_deploy_time, smoke_c_explode_delay)
     
     # 创建联合遮蔽判定函数
+    @lru_cache(maxsize=1000)
     def multiple_smoke_predicate(t: float, threshold: float) -> bool:
         """
         联合判定：多个烟幕弹的联合投影是否完全覆盖目标
@@ -429,11 +533,16 @@ def calculate_single_uav_triple_smoke_masking_multiple(
             under_points = get_under_points(missile_pos, calc.target_centers[0], calc.target_radius)
             all_target_points = top_points + under_points
             
-            feet = feet_of_perpendicular_to_anchor_target_lines(
-                smoke_pos, missile_pos, all_target_points
+            target_points_x = np.array([p[0] for p in all_target_points], dtype=np.float64)
+            target_points_y = np.array([p[1] for p in all_target_points], dtype=np.float64)
+            target_points_z = np.array([p[2] for p in all_target_points], dtype=np.float64)
+            
+            max_distance = _compute_max_distance_to_lines_numba(
+                smoke_pos[0], smoke_pos[1], smoke_pos[2],
+                missile_pos[0], missile_pos[1], missile_pos[2],
+                target_points_x, target_points_y, target_points_z
             )
-            distances = [distance_between(smoke_pos, foot) for foot in feet]
-            return distances and max(distances) <= threshold
+            return max_distance <= threshold
         
         # 多烟幕弹联合遮挡判定
         # 使用 for_merge.py 中的逻辑
