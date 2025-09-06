@@ -523,6 +523,25 @@ class TunedDifferentialEvolution:
                 print(f"  参数: F={F:.3f}, CR={CR:.3f}")
                 print(f"  最佳适应度: {self.best_fitness:.6f}")
                 print(f"  多样性: {diversity:.4f}, 停滞: {self.stagnation_count}, 重启: {self.restart_count}")
+                # 每代输出当前最佳解的前三个最长遮蔽区间
+                try:
+                    if self.best_individual is not None:
+                        pos = self.best_individual.position
+                        intervals, _dur = compute_intervals_for_params(
+                            uav_direction=float(pos[1]),
+                            uav_speed=float(pos[0]),
+                            smoke_deploy_time=float(pos[2]),
+                            smoke_explode_delay=float(pos[3]),
+                            algorithm="adaptive"
+                        )
+                        intervals_sorted = sorted(intervals, key=lambda ab: (ab[1] - ab[0]), reverse=True)
+                        top3 = intervals_sorted[:3]
+                        if len(top3) > 0:
+                            print(f"  前三区间: {top3}")
+                        else:
+                            print("  前三区间: []")
+                except Exception as e:
+                    print(f"  区间计算失败: {e}")
                 
                 # 回调（用于可视化/监控）
                 try:

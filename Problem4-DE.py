@@ -33,7 +33,7 @@ import matplotlib.pyplot as plt
 from typing import List, Tuple, Dict, Optional
 import time
 import random
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 import multiprocessing as mp
 from dataclasses import dataclass
 import copy
@@ -63,18 +63,83 @@ _cache_lock = threading.Lock()
 _cache_stats = {'hits': 0, 'misses': 0}
 _cache_access_order = []  # 用于LRU缓存管理
 
+# 适应度评估计时统计
+_fitness_timing_stats = {
+    'decode_time': [],
+    'cache_check_time': [],
+    'independent_time': [],
+    'multiple_time': [],
+    'cache_store_time': [],
+    'cache_hits': 0,
+    'cache_misses': 0
+}
+
 def clear_multiple_cache():
     """清空Multiple模式缓存"""
-    global _multiple_cache, _cache_stats, _cache_access_order
+    global _multiple_cache, _cache_stats, _cache_access_order, _fitness_timing_stats
     with _cache_lock:
         _multiple_cache.clear()
         _cache_access_order.clear()
         _cache_stats = {'hits': 0, 'misses': 0}
+        _fitness_timing_stats = {
+            'decode_time': [],
+            'cache_check_time': [],
+            'independent_time': [],
+            'multiple_time': [],
+            'cache_store_time': [],
+            'cache_hits': 0,
+            'cache_misses': 0
+        }
 
 def get_cache_stats():
     """获取缓存统计信息"""
     with _cache_lock:
         return _cache_stats.copy()
+
+def _record_fitness_timing(decode_time, cache_time, independent_time, multiple_time, cache_store_time, is_cache_hit):
+    """记录适应度评估的详细计时信息"""
+    global _fitness_timing_stats
+    with _cache_lock:
+        _fitness_timing_stats['decode_time'].append(decode_time)
+        _fitness_timing_stats['cache_check_time'].append(cache_time)
+        _fitness_timing_stats['independent_time'].append(independent_time)
+        _fitness_timing_stats['multiple_time'].append(multiple_time)
+        _fitness_timing_stats['cache_store_time'].append(cache_store_time)
+        
+        if is_cache_hit:
+            _fitness_timing_stats['cache_hits'] += 1
+        else:
+            _fitness_timing_stats['cache_misses'] += 1
+        
+        # 限制统计数据长度，防止内存泄漏
+        max_records = 1000
+        for key in ['decode_time', 'cache_check_time', 'independent_time', 'multiple_time', 'cache_store_time']:
+            if len(_fitness_timing_stats[key]) > max_records:
+                _fitness_timing_stats[key] = _fitness_timing_stats[key][-max_records//2:]
+
+def get_fitness_timing_stats():
+    """获取适应度评估计时统计信息"""
+    global _fitness_timing_stats
+    with _cache_lock:
+        stats = {}
+        for key in ['decode_time', 'cache_check_time', 'independent_time', 'multiple_time', 'cache_store_time']:
+            times = _fitness_timing_stats[key]
+            if times:
+                stats[key] = {
+                    'mean': np.mean(times),
+                    'total': np.sum(times),
+                    'count': len(times),
+                    'max': np.max(times),
+                    'min': np.min(times)
+                }
+            else:
+                stats[key] = {'mean': 0, 'total': 0, 'count': 0, 'max': 0, 'min': 0}
+        
+        stats['cache_hits'] = _fitness_timing_stats['cache_hits']
+        stats['cache_misses'] = _fitness_timing_stats['cache_misses']
+        stats['total_evaluations'] = _fitness_timing_stats['cache_hits'] + _fitness_timing_stats['cache_misses']
+        
+        return stats
 
 def _efficient_cache_cleanup():
     """高效的LRU缓存清理"""
@@ -103,7 +168,8 @@ def evaluate_individual_fitness_independent(individual_data):
     position, bounds_list = individual_data
     
     try:
-        # 解码位置 - 12个决策变量
+        # 步骤1：解码位置参数
+        decode_start = time.time()
         params = {
             'uav_a_direction': position[0],         # 无人机FY1方向
             'uav_a_speed': position[1],             # 无人机FY1速度
@@ -118,7 +184,10 @@ def evaluate_individual_fitness_independent(individual_data):
             'smoke_c_deploy_time': position[10],    # 烟幕弹C投放时间
             'smoke_c_explode_delay': position[11]   # 烟幕弹C引信延时
         }
+        decode_time = time.time() - decode_start
         
+        # 步骤2：独立遮蔽计算
+        independent_start = time.time()
         # 计算适应度 - 使用独立遮蔽模式
         duration = calculate_multi_uav_single_smoke_masking(
             uav_a_direction=params['uav_a_direction'],
@@ -134,12 +203,81 @@ def evaluate_individual_fitness_independent(individual_data):
             smoke_c_deploy_time=params['smoke_c_deploy_time'],
             smoke_c_explode_delay=params['smoke_c_explode_delay']
         )
+        independent_time = time.time() - independent_start
+        
+        # 记录独立模式的计时信息
+        _record_fitness_timing(decode_time, 0, independent_time, 0, 0, False)
         
         return duration
         
     except Exception as e:
         print(f"独立遮蔽计算错误: {e}")
         return -1000.0
+
+
+def evaluate_batch_fitness_independent(batch_data):
+    """批量评估个体适应度 - 独立遮蔽模式（高效并行版）"""
+    positions, bounds_list = batch_data
+    results = []
+    
+    # 预先创建共享的计算器和导弹轨迹（避免重复创建）
+    from solver.core import MaskingCalculator, find_t_intervals_adaptive
+    from solver.geometry import get_top_plane_points, get_under_points
+    from functools import lru_cache
+    import time
+    
+    calc = MaskingCalculator()
+    missile_traj = calc.traj_calc.create_missile_trajectory("M1")
+    
+    # 预计算一些共享数据
+    target_centers = calc.target_centers
+    target_radius = calc.target_radius
+    threshold = calc.threshold
+    time_step = calc.time_step
+    
+    batch_start = time.time()
+    
+    for position in positions:
+        try:
+            individual_start = time.time()
+            
+            # 解码参数
+            params = {
+                'uav_a_direction': position[0], 'uav_a_speed': position[1],
+                'uav_b_direction': position[2], 'uav_b_speed': position[3],
+                'uav_c_direction': position[4], 'uav_c_speed': position[5],
+                'smoke_a_deploy_time': position[6], 'smoke_a_explode_delay': position[7],
+                'smoke_b_deploy_time': position[8], 'smoke_b_explode_delay': position[9],
+                'smoke_c_deploy_time': position[10], 'smoke_c_explode_delay': position[11]
+            }
+            
+            # 直接调用原有函数（已经优化过的）
+            duration = calculate_multi_uav_single_smoke_masking(
+                uav_a_direction=params['uav_a_direction'],
+                uav_a_speed=params['uav_a_speed'],
+                uav_b_direction=params['uav_b_direction'],
+                uav_b_speed=params['uav_b_speed'],
+                uav_c_direction=params['uav_c_direction'],
+                uav_c_speed=params['uav_c_speed'],
+                smoke_a_deploy_time=params['smoke_a_deploy_time'],
+                smoke_a_explode_delay=params['smoke_a_explode_delay'],
+                smoke_b_deploy_time=params['smoke_b_deploy_time'],
+                smoke_b_explode_delay=params['smoke_b_explode_delay'],
+                smoke_c_deploy_time=params['smoke_c_deploy_time'],
+                smoke_c_explode_delay=params['smoke_c_explode_delay']
+            )
+            
+            results.append(duration)
+            
+        except Exception as e:
+            print(f"批量独立遮蔽计算错误: {e}")
+            results.append(-1000.0)
+    
+    batch_time = time.time() - batch_start
+    avg_time = batch_time / len(positions) if positions else 0
+    
+    # 返回结果和统计信息
+    return results
 
 
 def evaluate_individual_fitness_multiple(individual_data):
@@ -150,7 +288,8 @@ def evaluate_individual_fitness_multiple(individual_data):
     position, bounds_list = individual_data
     
     try:
-        # 解码位置 - 12个决策变量
+        # 步骤1：解码位置参数
+        decode_start = time.time()
         params = {
             'uav_a_direction': position[0],         # 无人机FY1方向
             'uav_a_speed': position[1],             # 无人机FY1速度
@@ -165,7 +304,10 @@ def evaluate_individual_fitness_multiple(individual_data):
             'smoke_c_deploy_time': position[10],    # 烟幕弹C投放时间
             'smoke_c_explode_delay': position[11]   # 烟幕弹C引信延时
         }
+        decode_time = time.time() - decode_start
         
+        # 步骤2：缓存检查
+        cache_start = time.time()
         # 🚀 优化策略1：高效缓存机制
         # 创建缓存键（降低精度以提高缓存命中率）
         cache_key = tuple(round(x, 3) for x in position)
@@ -177,9 +319,15 @@ def evaluate_individual_fitness_multiple(individual_data):
                 if cache_key in _cache_access_order:
                     _cache_access_order.remove(cache_key)
                 _cache_access_order.append(cache_key)
+                cache_time = time.time() - cache_start
+                # 记录缓存命中的计时信息
+                _record_fitness_timing(decode_time, cache_time, 0, 0, 0, True)
                 return _multiple_cache[cache_key]
             _cache_stats['misses'] += 1
+        cache_time = time.time() - cache_start
         
+        # 步骤3：独立遮蔽计算（快速筛选）
+        independent_start = time.time()
         # 🚀 优化策略2：先用独立模式快速筛选，再用联合模式精确计算
         # 如果独立模式结果很差，直接返回，避免昂贵的联合计算
         independent_duration = calculate_multi_uav_single_smoke_masking(
@@ -196,10 +344,14 @@ def evaluate_individual_fitness_multiple(individual_data):
             smoke_c_deploy_time=params['smoke_c_deploy_time'],
             smoke_c_explode_delay=params['smoke_c_explode_delay']
         )
+        independent_time = time.time() - independent_start
         
+        # 步骤4：联合遮蔽计算（精确计算）
+        multiple_start = time.time()
         # 如果独立模式结果太差（<2秒），直接返回，不进行昂贵的联合计算
         if independent_duration < 2.0:
             duration = independent_duration
+            multiple_time = 0  # 跳过联合计算
         else:
             # 计算适应度 - 使用联合遮蔽模式（仅对有希望的解进行精确计算）
             duration = calculate_multi_uav_single_smoke_masking_multiple(
@@ -216,7 +368,10 @@ def evaluate_individual_fitness_multiple(individual_data):
                 smoke_c_deploy_time=params['smoke_c_deploy_time'],
                 smoke_c_explode_delay=params['smoke_c_explode_delay']
             )
+        multiple_time = time.time() - multiple_start
         
+        # 步骤5：缓存存储
+        cache_store_start = time.time()
         # 高效缓存结果
         with _cache_lock:
             _multiple_cache[cache_key] = duration
@@ -225,6 +380,10 @@ def evaluate_individual_fitness_multiple(individual_data):
             # 高效缓存管理
             if len(_multiple_cache) > 1200:
                 _efficient_cache_cleanup()
+        cache_store_time = time.time() - cache_store_start
+        
+        # 记录详细计时信息
+        _record_fitness_timing(decode_time, cache_time, independent_time, multiple_time, cache_store_time, False)
         
         return duration
         
@@ -262,12 +421,12 @@ def calculate_bounds():
         'uav_c_speed': (70.0, 140.0),              # 无人机FY3速度
         
         # 烟幕弹参数
-        'smoke_a_deploy_time': (0.1, t_max - 5.0), # 烟幕弹A投放时间
-        'smoke_a_explode_delay': (0.1, 10.0),      # 烟幕弹A引信延时
-        'smoke_b_deploy_time': (0.1, t_max - 5.0), # 烟幕弹B投放时间
-        'smoke_b_explode_delay': (0.1, 10.0),      # 烟幕弹B引信延时
-        'smoke_c_deploy_time': (0.1, t_max - 5.0), # 烟幕弹C投放时间
-        'smoke_c_explode_delay': (0.1, 10.0)       # 烟幕弹C引信延时
+        'smoke_a_deploy_time': (0.01, t_max - 5.0), # 烟幕弹A投放时间
+        'smoke_a_explode_delay': (0.01, 10.0),      # 烟幕弹A引信延时
+        'smoke_b_deploy_time': (0.01, t_max - 5.0), # 烟幕弹B投放时间
+        'smoke_b_explode_delay': (0.01, 10.0),      # 烟幕弹B引信延时
+        'smoke_c_deploy_time': (0.01, t_max - 5.0), # 烟幕弹C投放时间
+        'smoke_c_explode_delay': (0.01, 10.0)       # 烟幕弹C引信延时
     }
     
     return bounds
@@ -285,6 +444,7 @@ class DifferentialEvolution_Problem4:
                  CR_max: float = 0.95,
                  bounds: Dict[str, Tuple[float, float]] = None,
                  use_parallel: bool = True,
+                 parallel_mode: str = "process",      # "process" or "thread"
                  masking_mode: str = "independent",   # "independent" or "multiple"
                  restart_threshold: int = 50,         # 高维问题需要更长的停滞容忍
                  local_search_prob: float = 0.12,
@@ -307,6 +467,7 @@ class DifferentialEvolution_Problem4:
         self.CR_min = CR_min
         self.CR_max = CR_max
         self.use_parallel = use_parallel
+        self.parallel_mode = parallel_mode
         self.masking_mode = masking_mode
         self.restart_threshold = restart_threshold
         self.local_search_prob = local_search_prob
@@ -369,8 +530,11 @@ class DifferentialEvolution_Problem4:
         
         # 并行计算设置
         if self.use_parallel:
-            self.n_processes = min(mp.cpu_count(), population_size)
-            print(f"将使用 {self.n_processes} 个进程进行并行计算")
+            self.n_processes = min(8, mp.cpu_count(), max(2, population_size // 4))  # 最多8个进程
+            if parallel_mode == "thread":
+                print(f"将使用 {self.n_processes} 个线程进行并行计算")
+            else:
+                print(f"将使用 {self.n_processes} 个进程进行并行计算")
         
         # 中断处理标志
         self.interrupted = False
@@ -775,7 +939,8 @@ class DifferentialEvolution_Problem4:
             generation_start_time = time.time()  # 记录每代开始时间
             print(f"\n第 {generation+1}/{self.max_generations} 代")
             
-            # 自适应参数
+            # 步骤1：自适应参数调整
+            step1_start = time.time()
             F, CR = self._adaptive_parameters(generation)
             self.parameter_history['F'].append(F)
             self.parameter_history['CR'].append(CR)
@@ -784,55 +949,136 @@ class DifferentialEvolution_Problem4:
             if len(self.parameter_history['F']) > self.max_history_length:
                 self.parameter_history['F'] = self.parameter_history['F'][-self.max_history_length//2:]
                 self.parameter_history['CR'] = self.parameter_history['CR'][-self.max_history_length//2:]
+            step1_time = time.time() - step1_start
             
-            # 选择变异策略
+            # 步骤2：选择变异策略
+            step2_start = time.time()
             strategy = self._select_mutation_strategy(generation)
             self.strategy_usage_count[strategy] += 1
+            step2_time = time.time() - step2_start
             
-            # 创建新种群
+            # 步骤3：变异、交叉、评估循环
+            step3_start = time.time()
+            mutation_time = 0
+            crossover_time = 0
+            evaluation_time = 0
+            local_search_time = 0
+            
             new_population = []
             successful_mutations = 0
+            trials = []
             
+            # 步骤3.1：生成所有变异和交叉个体
             for i in range(self.population_size):
                 # 变异
+                mut_start = time.time()
                 mutant = self._mutate(i, F, strategy)
+                mutation_time += time.time() - mut_start
                 
                 # 交叉
+                cross_start = time.time()
                 crossover_type = 'exp' if 'exp' in strategy else 'bin'
                 trial = self._crossover(self.population[i].position, mutant, CR, crossover_type)
+                crossover_time += time.time() - cross_start
                 
-                # 评估试验个体
-                trial_fitness = self.fitness_function((trial, self.bounds_list))
+                # 收集试验个体，稍后批量并行评估
+                trials.append(trial)
+            
+            # 步骤3.2：批量并行评估所有试验个体
+            eval_start = time.time()
+            if self.use_parallel and self.masking_mode == "independent":
+                # 对于独立模式，使用批量并行计算优化
+                # 确保每个进程至少处理2个个体，最多处理population_size/2个个体
+                batch_size = max(2, min(self.population_size // 2, self.population_size // self.n_processes))
+                trial_fitness_list = []
                 
-                # 选择
+                # 将试验个体分批处理，确保充分利用所有进程
+                trial_batches = []
+                for i in range(0, len(trials), batch_size):
+                    batch = trials[i:i+batch_size]
+                    if batch:  # 确保批次不为空
+                        trial_batches.append(batch)
+                
+                batch_data = [(batch, self.bounds_list) for batch in trial_batches]
+                
+                executor_type = "线程" if self.parallel_mode == "thread" else "进程"
+                print(f"      🚀 启动{len(trial_batches)}个批次，每批{batch_size}个体，使用{self.n_processes}个{executor_type}")
+                
+                ExecutorClass = ThreadPoolExecutor if self.parallel_mode == "thread" else ProcessPoolExecutor
+                with ExecutorClass(max_workers=self.n_processes) as executor:
+                    futures = {executor.submit(evaluate_batch_fitness_independent, data): i 
+                              for i, data in enumerate(batch_data)}
+                    batch_results = [None] * len(trial_batches)
+                    for future in as_completed(futures):
+                        idx = futures[future]
+                        batch_results[idx] = future.result()
+                
+                # 合并批量结果
+                for batch_result in batch_results:
+                    if batch_result:  # 确保结果不为空
+                        trial_fitness_list.extend(batch_result)
+                    
+            elif self.use_parallel:
+                # 原有的个体级并行计算（用于multiple模式）
+                trial_data = [(trial, self.bounds_list) for trial in trials]
+                ExecutorClass = ThreadPoolExecutor if self.parallel_mode == "thread" else ProcessPoolExecutor
+                with ExecutorClass(max_workers=self.n_processes) as executor:
+                    futures = {executor.submit(self.fitness_function, data): i 
+                              for i, data in enumerate(trial_data)}
+                    trial_fitness_list = [None] * self.population_size
+                    for future in as_completed(futures):
+                        idx = futures[future]
+                        trial_fitness_list[idx] = future.result()
+            else:
+                trial_fitness_list = [self.fitness_function((trial, self.bounds_list)) for trial in trials]
+            evaluation_time += time.time() - eval_start
+            
+            # 步骤3.3：选择和局部搜索
+            for i in range(self.population_size):
+                trial_fitness = trial_fitness_list[i]
                 if trial_fitness > self.population[i].fitness:
-                    new_individual = Individual(position=trial, fitness=trial_fitness, generation=generation)
+                    new_individual = Individual(position=trials[i], fitness=trial_fitness, generation=generation)
                     # 局部搜索增强（降低频率以提高性能）
                     if generation % 4 == 0:  # 每4代进行一次局部搜索
+                        ls_start = time.time()
                         new_individual = self._local_search(new_individual)
+                        local_search_time += time.time() - ls_start
                     new_population.append(new_individual)
                     successful_mutations += 1
                 else:
                     # 🚀 避免深拷贝，直接复制引用（Individual是不可变的）
                     new_population.append(self.population[i])
             
-            # 更新策略成功计数
+            step3_time = time.time() - step3_start
+            
+            # 步骤4：更新策略成功计数
+            step4_start = time.time()
             if successful_mutations > 0:
                 self.strategy_success_count[strategy] += successful_mutations
+            step4_time = time.time() - step4_start
             
-            # 更新种群
+            # 步骤5：更新种群
+            step5_start = time.time()
             self.population = new_population
+            step5_time = time.time() - step5_start
             
-            # 更新最佳个体
+            # 步骤6：更新最佳个体
+            step6_start = time.time()
             self._update_best()
+            step6_time = time.time() - step6_start
             
-            # 子种群迁移
+            # 步骤7：子种群迁移
+            step7_start = time.time()
             self._migration(generation)
+            step7_time = time.time() - step7_start
             
-            # 重启机制
+            # 步骤8：重启机制
+            step8_start = time.time()
             self._restart_mechanism()
+            step8_time = time.time() - step8_start
             
-            # 计算多样性（每5代计算一次以提高性能）
+            # 步骤9：计算多样性（每5代计算一次以提高性能）
+            step9_start = time.time()
             if generation % 5 == 0:
                 diversity = self._calculate_diversity()
                 self.diversity_history.append(diversity)
@@ -841,11 +1087,14 @@ class DifferentialEvolution_Problem4:
                     self.diversity_history = self.diversity_history[-self.max_history_length//2:]
             else:
                 diversity = self.diversity_history[-1] if self.diversity_history else 0.0
+            step9_time = time.time() - step9_start
             
-            # 记录历史（限制长度）
+            # 步骤10：记录历史（限制长度）
+            step10_start = time.time()
             self.fitness_history.append(self.best_fitness)
             if len(self.fitness_history) > self.max_history_length:
                 self.fitness_history = self.fitness_history[-self.max_history_length//2:]
+            step10_time = time.time() - step10_start
             
             # 输出信息
             generation_time = time.time() - generation_start_time
@@ -857,6 +1106,45 @@ class DifferentialEvolution_Problem4:
             print(f"  成功率: {success_rate:.1%}, 多样性: {diversity:.4f}")
             print(f"  停滞: {self.stagnation_count}, 重启: {self.restart_count}")
             print(f"  本代用时: {generation_time:.2f}s")
+            
+            # 详细耗时分析
+            print(f"  ⏱️ 耗时分析:")
+            print(f"    参数调整: {step1_time*1000:.1f}ms")
+            print(f"    策略选择: {step2_time*1000:.1f}ms")
+            print(f"    变异操作: {mutation_time*1000:.1f}ms")
+            print(f"    交叉操作: {crossover_time*1000:.1f}ms")
+            print(f"    适应度评估: {evaluation_time:.3f}s ({evaluation_time/generation_time*100:.1f}%)")
+            if self.masking_mode == "independent" and self.use_parallel:
+                avg_per_individual = evaluation_time / self.population_size
+                speedup_ratio = 74.9 / (avg_per_individual * 1000)
+                print(f"      批量并行优化: 平均每个体{avg_per_individual*1000:.1f}ms")
+                print(f"      性能提升: {speedup_ratio:.1f}x 加速 (原{74.9:.1f}ms → 现{avg_per_individual*1000:.1f}ms)")
+                print(f"      并行效率: {speedup_ratio/self.n_processes*100:.1f}% (理论最大{self.n_processes}x)")
+            
+            # 适应度评估详细分解
+            if generation % 10 == 0:  # 每10代输出一次详细的适应度计时统计
+                fitness_stats = get_fitness_timing_stats()
+                if fitness_stats['total_evaluations'] > 0:
+                    print(f"      🔍 适应度评估详细分解 (最近{fitness_stats['total_evaluations']}次):")
+                    print(f"        参数解码: {fitness_stats['decode_time']['mean']*1000:.2f}ms (总计{fitness_stats['decode_time']['total']*1000:.1f}ms)")
+                    if fitness_stats['cache_check_time']['total'] > 0:
+                        print(f"        缓存检查: {fitness_stats['cache_check_time']['mean']*1000:.2f}ms (总计{fitness_stats['cache_check_time']['total']*1000:.1f}ms)")
+                    print(f"        独立遮蔽计算: {fitness_stats['independent_time']['mean']*1000:.1f}ms (总计{fitness_stats['independent_time']['total']:.2f}s)")
+                    if fitness_stats['multiple_time']['total'] > 0:
+                        print(f"        联合遮蔽计算: {fitness_stats['multiple_time']['mean']*1000:.1f}ms (总计{fitness_stats['multiple_time']['total']:.2f}s)")
+                    if fitness_stats['cache_store_time']['total'] > 0:
+                        print(f"        缓存存储: {fitness_stats['cache_store_time']['mean']*1000:.2f}ms (总计{fitness_stats['cache_store_time']['total']*1000:.1f}ms)")
+                    print(f"        缓存命中率: {fitness_stats['cache_hits']}/{fitness_stats['total_evaluations']} ({fitness_stats['cache_hits']/max(1,fitness_stats['total_evaluations'])*100:.1f}%)")
+            
+            if local_search_time > 0:
+                print(f"    局部搜索: {local_search_time:.3f}s ({local_search_time/generation_time*100:.1f}%)")
+            print(f"    策略统计: {step4_time*1000:.1f}ms")
+            print(f"    种群更新: {step5_time*1000:.1f}ms")
+            print(f"    最佳更新: {step6_time*1000:.1f}ms")
+            print(f"    种群迁移: {step7_time*1000:.1f}ms")
+            print(f"    重启机制: {step8_time*1000:.1f}ms")
+            print(f"    多样性计算: {step9_time*1000:.1f}ms")
+            print(f"    历史记录: {step10_time*1000:.1f}ms")
             
             # 定期清理缓存以防止内存泄漏
             if generation % 40 == 0 and self.masking_mode == "multiple":

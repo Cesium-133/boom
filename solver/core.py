@@ -256,7 +256,7 @@ def calculate_single_uav_single_smoke_masking(
     missile_traj = calc.traj_calc.create_missile_trajectory("M1")
     
     # 创建无人机轨迹
-    uav_traj = calc.traj_calc.create_uav_trajectory("FY1", direction_degrees=uav_direction, speed=uav_speed)
+    uav_traj = calc.traj_calc.create_uav_trajectory("FY3", direction_degrees=uav_direction, speed=uav_speed)
     
     # 创建烟幕云轨迹
     smoke_traj = calc.traj_calc.create_smoke_trajectory(uav_traj, smoke_deploy_time, smoke_explode_delay)

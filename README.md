@@ -82,6 +82,21 @@ masking_duration = calculate_single_uav_single_smoke_masking(
 print(f"有效遮蔽时长: {masking_duration:.2f}秒")
 ```
 
+### 可视化调参 UI（Streamlit）
+
+- 启动命令：
+
+```bash
+python -m streamlit run scripts/tuner_ui.py
+```
+
+- 功能：
+  - 实时曲线：最佳适应度、种群多样性
+  - 散点分布：`t_deploy` 与 `t_fuse` 的当前种群分布（颜色代表适应度）
+  - 局部最优性：围绕当前最优解的二维邻域热力图，检测是否“近似局部最优”
+
+- Windows 提示：为避免多进程在动态模块加载上的问题，UI 默认关闭并行开关；如需开启请在侧栏勾选。
+
 ### 配置参数
 
 系统默认配置参数包括：
@@ -114,3 +129,54 @@ print(f"有效遮蔽时长: {masking_duration:.2f}秒")
 2. 坐标系采用右手坐标系，z轴向上
 3. 时间参数均为相对时间，单位为秒
 4. 遮蔽效果基于几何遮挡模型，未考虑风力等环境因素
+
+### 高级优化器：iL-SHADE
+
+- **脚本**: `Problem2-iL-SHADE.py`
+- **算法**: iL-SHADE（L-SHADE 改进版，current-to-pbest/1+Archive，自适应F/CR，线性种群收缩）
+- **用法**:
+```bash
+python Problem2-iL-SHADE.py
+```
+- **关键参数**:
+  - `population_size_init`: 初始种群规模（默认80）
+  - `population_size_min`: 最小种群规模（默认20）
+  - `max_generations`: 最大迭代代数（默认800）
+  - `memory_size`: 参数记忆槽规模H（默认20）
+  - `p_best_max`: pbest 上界（默认0.2，pmin自适应为2/NP）
+  - `use_parallel`: 是否并行评估（默认True）
+
+- **输出**: 控制台打印最佳适应度与对应参数，返回优化过程记录
+
+### 服务器版本：80核心并行
+
+- **脚本**: `Problem4-DE-Server.py`
+- **用途**: 针对80核心服务器优化的高性能版本
+- **特性**:
+  - 80个个体完全并行计算（每个体一个进程）
+  - 自动检查点保存和恢复机制
+  - 实时性能监控和资源使用统计
+  - 优雅的中断处理和错误恢复
+  - 支持长时间运行（2000代+）
+
+- **服务器要求**:
+  - CPU: 80+ 核心
+  - RAM: 32GB+
+  - Python 3.8+
+  - 推荐操作系统: Linux
+
+- **用法**:
+```bash
+python Problem4-DE-Server.py
+```
+
+- **性能目标**:
+  - 每代评估时间: < 100ms
+  - 每个体平均时间: < 1.5ms
+  - 并行效率: > 70%
+  - 理论加速比: 80x
+
+- **检查点功能**:
+  - 自动保存: 每50代保存一次检查点
+  - 恢复运行: 支持从任意检查点恢复优化
+  - 异常保护: 意外中断时自动保存当前最优解
