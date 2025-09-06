@@ -64,7 +64,7 @@ UAVS = {
 
 # 计算参数
 CALCULATION_PARAMS = {
-    "time_step": 0.01,                  # 时间步长 (s)
+    "time_step": 0.1,                  # 时间步长 (s)
     "max_simulation_time": 100.0,       # 最大仿真时间 (s)
     "masking_threshold": 10.0,          # 遮蔽阈值距离 (m)
     "boundary_refinement_iters": 25     # 边界细化迭代次数
@@ -76,3 +76,48 @@ SMOKE_PARAMS = {
     "cloud_sink_speed": 3,              # 烟幕云下沉速度 (m/s)
     "duration": 20                      # 烟幕持续时间 (s)
 }
+
+# 第五问优化参数边界定义
+def calculate_problem5_bounds():
+    """计算第五问的搜索空间边界"""
+    import numpy as np
+    from .trajectory import TrajectoryCalculator
+    
+    traj_calc = TrajectoryCalculator()
+    
+    # 计算三枚导弹到达虚假目标的最大时间
+    max_times = []
+    for missile_id in ["M1", "M2", "M3"]:
+        missile_pos = MISSILES[missile_id]["initial_pos"]
+        missile_speed = MISSILES[missile_id]["speed"]
+        fake_target = TARGETS["fake_target"]
+        
+        distance = np.sqrt(
+            (fake_target[0] - missile_pos[0])**2 + 
+            (fake_target[1] - missile_pos[1])**2 + 
+            (fake_target[2] - missile_pos[2])**2
+        )
+        t_max = distance / missile_speed
+        max_times.append(t_max)
+    
+    # 使用最大时间作为时间边界
+    global_t_max = max(max_times)
+    
+    bounds = {}
+    
+    # 5架无人机参数（每架无人机最多投放3枚烟幕弹）
+    for uav_idx in range(5):  # FY1-FY5
+        uav_name = f"uav_{uav_idx+1}"
+        bounds[f'{uav_name}_direction'] = (0.0, 360.0)      # 飞行方向
+        bounds[f'{uav_name}_speed'] = (70.0, 140.0)         # 飞行速度
+        
+        # 每架无人机最多3枚烟幕弹
+        for smoke_idx in range(3):
+            smoke_name = f"{uav_name}_smoke_{smoke_idx+1}"
+            bounds[f'{smoke_name}_deploy_time'] = (0.01, global_t_max - 2.0)  # 投放时间
+            bounds[f'{smoke_name}_explode_delay'] = (0.01, 8.0)               # 起爆延时
+    
+    return bounds
+
+# 为向后兼容，定义BOUNDS常量
+BOUNDS = calculate_problem5_bounds()

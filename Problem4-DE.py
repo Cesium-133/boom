@@ -534,7 +534,7 @@ class DifferentialEvolution_Problem4:
             if parallel_mode == "thread":
                 print(f"将使用 {self.n_processes} 个线程进行并行计算")
             else:
-                print(f"将使用 {self.n_processes} 个进程进行并行计算")
+            print(f"将使用 {self.n_processes} 个进程进行并行计算")
         
         # 中断处理标志
         self.interrupted = False

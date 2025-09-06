@@ -9,7 +9,8 @@ from .core import (
     calculate_single_uav_triple_smoke_masking,
     calculate_multi_uav_single_smoke_masking,
     calculate_single_uav_triple_smoke_masking_multiple,
-    calculate_multi_uav_single_smoke_masking_multiple
+    calculate_multi_uav_single_smoke_masking_multiple,
+    calculate_problem5_multi_uav_multi_missile_masking
 )
 
 from .config import CONSTANTS, TARGETS, MISSILES, UAVS, SMOKE_PARAMS
@@ -20,6 +21,7 @@ __all__ = [
     'calculate_multi_uav_single_smoke_masking',
     'calculate_single_uav_triple_smoke_masking_multiple',
     'calculate_multi_uav_single_smoke_masking_multiple',
+    'calculate_problem5_multi_uav_multi_missile_masking',
     'CONSTANTS',
     'TARGETS',
     'MISSILES',

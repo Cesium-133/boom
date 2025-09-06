@@ -686,3 +686,157 @@ def calculate_multi_uav_single_smoke_masking_multiple(
 
 
 # 所有计算函数已在上面定义完成
+
+def calculate_problem5_multi_uav_multi_missile_masking(
+    # 5架无人机参数
+    uav_1_direction: float, uav_1_speed: float,
+    uav_2_direction: float, uav_2_speed: float,
+    uav_3_direction: float, uav_3_speed: float,
+    uav_4_direction: float, uav_4_speed: float,
+    uav_5_direction: float, uav_5_speed: float,
+    # 每架无人机3枚烟幕弹参数 (15枚烟幕弹)
+    uav_1_smoke_1_deploy_time: float, uav_1_smoke_1_explode_delay: float,
+    uav_1_smoke_2_deploy_time: float, uav_1_smoke_2_explode_delay: float,
+    uav_1_smoke_3_deploy_time: float, uav_1_smoke_3_explode_delay: float,
+    uav_2_smoke_1_deploy_time: float, uav_2_smoke_1_explode_delay: float,
+    uav_2_smoke_2_deploy_time: float, uav_2_smoke_2_explode_delay: float,
+    uav_2_smoke_3_deploy_time: float, uav_2_smoke_3_explode_delay: float,
+    uav_3_smoke_1_deploy_time: float, uav_3_smoke_1_explode_delay: float,
+    uav_3_smoke_2_deploy_time: float, uav_3_smoke_2_explode_delay: float,
+    uav_3_smoke_3_deploy_time: float, uav_3_smoke_3_explode_delay: float,
+    uav_4_smoke_1_deploy_time: float, uav_4_smoke_1_explode_delay: float,
+    uav_4_smoke_2_deploy_time: float, uav_4_smoke_2_explode_delay: float,
+    uav_4_smoke_3_deploy_time: float, uav_4_smoke_3_explode_delay: float,
+    uav_5_smoke_1_deploy_time: float, uav_5_smoke_1_explode_delay: float,
+    uav_5_smoke_2_deploy_time: float, uav_5_smoke_2_explode_delay: float,
+    uav_5_smoke_3_deploy_time: float, uav_5_smoke_3_explode_delay: float
+) -> float:
+    """
+    计算第五问：5架无人机每架最多3枚烟幕弹对3枚导弹的综合遮蔽效果
+    
+    目标：最大化对M1、M2、M3三枚导弹的综合遮蔽时长
+    
+    Args:
+        uav_*_direction: 无人机飞行方向（度，0-360）
+        uav_*_speed: 无人机飞行速度（m/s）
+        uav_*_smoke_*_deploy_time: 烟幕弹投放时间（s）
+        uav_*_smoke_*_explode_delay: 烟幕弹起爆延时（s）
+        
+    Returns:
+        综合遮蔽效果评分（考虑所有导弹的遮蔽时长）
+    """
+    calc = MaskingCalculator()
+    
+    # 创建三枚导弹的轨迹
+    missile_trajs = {
+        'M1': calc.traj_calc.create_missile_trajectory("M1"),
+        'M2': calc.traj_calc.create_missile_trajectory("M2"),
+        'M3': calc.traj_calc.create_missile_trajectory("M3")
+    }
+    
+    # 创建5架无人机轨迹
+    uav_params = [
+        (uav_1_direction, uav_1_speed, "FY1"),
+        (uav_2_direction, uav_2_speed, "FY2"),
+        (uav_3_direction, uav_3_speed, "FY3"),
+        (uav_4_direction, uav_4_speed, "FY4"),
+        (uav_5_direction, uav_5_speed, "FY5")
+    ]
+    
+    uav_trajs = {}
+    for i, (direction, speed, uav_id) in enumerate(uav_params):
+        uav_trajs[f'UAV_{i+1}'] = calc.traj_calc.create_uav_trajectory(
+            uav_id, direction_degrees=direction, speed=speed
+        )
+    
+    # 创建所有烟幕弹轨迹（15枚烟幕弹）
+    smoke_params = [
+        # UAV1的3枚烟幕弹
+        (uav_1_smoke_1_deploy_time, uav_1_smoke_1_explode_delay, 'UAV_1'),
+        (uav_1_smoke_2_deploy_time, uav_1_smoke_2_explode_delay, 'UAV_1'),
+        (uav_1_smoke_3_deploy_time, uav_1_smoke_3_explode_delay, 'UAV_1'),
+        # UAV2的3枚烟幕弹
+        (uav_2_smoke_1_deploy_time, uav_2_smoke_1_explode_delay, 'UAV_2'),
+        (uav_2_smoke_2_deploy_time, uav_2_smoke_2_explode_delay, 'UAV_2'),
+        (uav_2_smoke_3_deploy_time, uav_2_smoke_3_explode_delay, 'UAV_2'),
+        # UAV3的3枚烟幕弹
+        (uav_3_smoke_1_deploy_time, uav_3_smoke_1_explode_delay, 'UAV_3'),
+        (uav_3_smoke_2_deploy_time, uav_3_smoke_2_explode_delay, 'UAV_3'),
+        (uav_3_smoke_3_deploy_time, uav_3_smoke_3_explode_delay, 'UAV_3'),
+        # UAV4的3枚烟幕弹
+        (uav_4_smoke_1_deploy_time, uav_4_smoke_1_explode_delay, 'UAV_4'),
+        (uav_4_smoke_2_deploy_time, uav_4_smoke_2_explode_delay, 'UAV_4'),
+        (uav_4_smoke_3_deploy_time, uav_4_smoke_3_explode_delay, 'UAV_4'),
+        # UAV5的3枚烟幕弹
+        (uav_5_smoke_1_deploy_time, uav_5_smoke_1_explode_delay, 'UAV_5'),
+        (uav_5_smoke_2_deploy_time, uav_5_smoke_2_explode_delay, 'UAV_5'),
+        (uav_5_smoke_3_deploy_time, uav_5_smoke_3_explode_delay, 'UAV_5')
+    ]
+    
+    smoke_trajs = []
+    for deploy_time, explode_delay, uav_key in smoke_params:
+        smoke_traj = calc.traj_calc.create_smoke_trajectory(
+            uav_trajs[uav_key], deploy_time, explode_delay
+        )
+        smoke_trajs.append((smoke_traj, deploy_time + explode_delay))
+    
+    # 计算每枚导弹的遮蔽效果
+    total_masking_score = 0.0
+    missile_weights = {'M1': 1.0, 'M2': 1.0, 'M3': 1.0}  # 可以调整权重
+    
+    for missile_id, missile_traj in missile_trajs.items():
+        # 为当前导弹创建组合遮蔽判定函数
+        @lru_cache(maxsize=1000)
+        def missile_predicate(t: float, threshold: float) -> bool:
+            """组合判定：任一烟幕云满足遮蔽条件即可"""
+            missile_pos = missile_traj(t)
+            
+            # 计算所有目标点
+            top_points = get_top_plane_points(missile_pos, calc.target_centers[1], calc.target_radius)
+            under_points = get_under_points(missile_pos, calc.target_centers[0], calc.target_radius)
+            all_target_points = top_points + under_points
+            
+            # 转换为NumPy数组
+            target_points_x = np.array([p[0] for p in all_target_points], dtype=np.float64)
+            target_points_y = np.array([p[1] for p in all_target_points], dtype=np.float64)
+            target_points_z = np.array([p[2] for p in all_target_points], dtype=np.float64)
+            
+            # 检查每个活跃烟幕云的遮蔽效果
+            for smoke_traj, explode_time in smoke_trajs:
+                if t >= explode_time:  # 烟幕弹已起爆
+                    smoke_pos = smoke_traj(t)
+                    max_distance = _compute_max_distance_to_lines_numba(
+                        smoke_pos[0], smoke_pos[1], smoke_pos[2],
+                        missile_pos[0], missile_pos[1], missile_pos[2],
+                        target_points_x, target_points_y, target_points_z
+                    )
+                    if max_distance <= threshold:
+                        return True
+            
+            return False
+        
+        # 计算最早起爆时间
+        earliest_explode = min(explode_time for _, explode_time in smoke_trajs)
+        
+        # 计算时间边界
+        _, end_time = calc.traj_calc.get_trajectory_bounds(missile_traj, calc.max_time)
+        
+        # 寻找满足条件的时间区间
+        intervals = find_t_intervals_adaptive(
+            missile_predicate,
+            calc.threshold,
+            earliest_explode,
+            end_time,
+            initial_step=calc.time_step * 10,
+            min_step=calc.time_step / 2,
+            max_step=calc.time_step * 50
+        )
+        
+        # 计算当前导弹的遮蔽时长
+        missile_masking_duration = sum(b - a for a, b in intervals)
+        total_masking_score += missile_weights[missile_id] * missile_masking_duration
+        
+        # 清空缓存以避免内存泄漏
+        missile_predicate.cache_clear()
+    
+    return total_masking_score

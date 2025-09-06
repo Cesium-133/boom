@@ -13,6 +13,11 @@ CUMCM2025 Problem 4 - 高性能服务器版本 (80核心并行优化)
 - 80个个体完全并行计算
 - 每代评估时间 < 100ms
 - 支持长时间运行和检查点保存
+
+优化改进：
+- 持久化进程池，避免重复创建销毁开销
+- 改进的性能监控和瓶颈分析
+- 更智能的checkpoint恢复机制
 """
 
 import numpy as np
@@ -29,14 +34,14 @@ import signal
 import logging
 from pathlib import Path
 import psutil
+import glob
 
 # 添加项目根目录到路径
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from solver.core import (
     calculate_multi_uav_single_smoke_masking,
-    calculate_multi_uav_single_smoke_masking_multiple,
-    clear_multiple_cache
+    calculate_multi_uav_single_smoke_masking_multiple
 )
 from solver.config import BOUNDS
 
@@ -50,9 +55,10 @@ class ServerConfig:
     max_cores: int = 80              # 最大核心数
     memory_limit_gb: int = 32        # 内存限制(GB)
     checkpoint_interval: int = 50    # 检查点保存间隔
-    checkpoint_dir: str = "./checkpoints"
+    checkpoint_dir: str = "./server_checkpoints"
     log_level: str = "INFO"
     process_timeout: int = 300       # 进程超时时间(秒)
+    use_persistent_pool: bool = True # 使用持久化进程池
 
 class ServerOptimizedDE:
     """针对80核心服务器优化的差分进化算法"""
@@ -80,6 +86,9 @@ class ServerOptimizedDE:
         self.use_adaptive = use_adaptive
         self.checkpoint_name = checkpoint_name
         
+        # 持久化进程池
+        self.executor = None
+        
         # 服务器资源检查
         self._check_server_resources()
         
@@ -94,7 +103,10 @@ class ServerOptimizedDE:
             'generation_times': [],
             'evaluation_times': [],
             'parallel_efficiency': [],
-            'memory_usage': []
+            'memory_usage': [],
+            'process_overhead': [],      # 进程管理开销
+            'sync_overhead': [],         # 同步等待开销
+            'individual_times': []       # 单个个体计算时间
         }
         
         logger.info(f"服务器版DE初始化完成 - {self.n_processes}核心并行")
@@ -149,6 +161,7 @@ class ServerOptimizedDE:
         }
         
         logger.info(f"并行配置: {self.n_processes}个进程，每个体独立进程")
+        logger.info(f"持久化进程池: {'启用' if self.server_config.use_persistent_pool else '禁用'}")
 
     def _create_bounds_list(self):
         """创建边界列表"""
@@ -207,6 +220,35 @@ class ServerOptimizedDE:
             logger.error(f"加载检查点失败: {e}")
             return None
 
+    def find_latest_checkpoint(self) -> Optional[str]:
+        """查找最新的checkpoint文件"""
+        checkpoint_dir = Path(self.server_config.checkpoint_dir)
+        if not checkpoint_dir.exists():
+            return None
+            
+        pattern = f"{self.checkpoint_name}_gen_*.pkl"
+        checkpoints = list(checkpoint_dir.glob(pattern))
+        
+        if not checkpoints:
+            return None
+            
+        # 按生成数排序，返回最新的
+        latest = max(checkpoints, key=lambda x: int(x.stem.split('_')[-1]))
+        return str(latest)
+
+    def _initialize_persistent_pool(self):
+        """初始化持久化进程池"""
+        if self.server_config.use_persistent_pool and self.executor is None:
+            logger.info("初始化持久化进程池...")
+            self.executor = ProcessPoolExecutor(**self.process_pool_config)
+
+    def _cleanup_persistent_pool(self):
+        """清理持久化进程池"""
+        if self.executor is not None:
+            logger.info("清理持久化进程池...")
+            self.executor.shutdown(wait=True)
+            self.executor = None
+
     def optimize(self, resume_from: Optional[str] = None):
         """服务器优化主循环"""
         logger.info("="*80)
@@ -215,42 +257,47 @@ class ServerOptimizedDE:
         logger.info(f"并行核心: {self.n_processes}, 遮蔽模式: {self.masking_mode}")
         logger.info("="*80)
         
-        # 检查是否从检查点恢复
-        start_generation = 0
-        if resume_from:
-            checkpoint_data = self.load_checkpoint(resume_from)
-            if checkpoint_data:
-                population = checkpoint_data['population']
-                fitness = checkpoint_data['fitness']
-                best_fitness = checkpoint_data['best_fitness']
-                best_individual = checkpoint_data['best_individual']
-                start_generation = checkpoint_data['generation'] + 1
-                self.performance_stats = checkpoint_data.get('performance_stats', self.performance_stats)
-                logger.info(f"从第{start_generation}代恢复优化")
-            else:
-                logger.error("检查点加载失败，从头开始")
-                resume_from = None
-
-        # 初始化种群
-        if not resume_from:
-            bounds_list = self._create_bounds_list()
-            population = self._initialize_population(bounds_list)
-            fitness = self._evaluate_population_server(population, bounds_list)
-            best_idx = np.argmax(fitness)
-            best_fitness = fitness[best_idx]
-            best_individual = population[best_idx].copy()
-            logger.info(f"初始种群最优适应度: {best_fitness:.6f}")
-
-        # 设置信号处理（优雅退出）
-        self._setup_signal_handlers()
+        # 初始化持久化进程池
+        self._initialize_persistent_pool()
         
         try:
+            # 检查是否从检查点恢复
+            start_generation = 0
+            if resume_from:
+                checkpoint_data = self.load_checkpoint(resume_from)
+                if checkpoint_data:
+                    population = checkpoint_data['population']
+                    fitness = checkpoint_data['fitness']
+                    best_fitness = checkpoint_data['best_fitness']
+                    best_individual = checkpoint_data['best_individual']
+                    start_generation = checkpoint_data['generation'] + 1
+                    self.performance_stats = checkpoint_data.get('performance_stats', self.performance_stats)
+                    logger.info(f"从第{start_generation}代恢复优化，当前最优: {best_fitness:.6f}")
+                else:
+                    logger.error("检查点加载失败，从头开始")
+                    resume_from = None
+
+            # 初始化种群
+            if not resume_from:
+                bounds_list = self._create_bounds_list()
+                population = self._initialize_population(bounds_list)
+                fitness = self._evaluate_population_server(population, bounds_list)
+                best_idx = np.argmax(fitness)
+                best_fitness = fitness[best_idx]
+                best_individual = population[best_idx].copy()
+                logger.info(f"初始种群最优适应度: {best_fitness:.6f}")
+
+            # 设置信号处理（优雅退出）
+            self._setup_signal_handlers()
+            
             # 主优化循环
             for generation in range(start_generation, self.max_generations):
                 generation_start = time.time()
                 
                 # 生成试验向量
+                trial_start = time.time()
                 trials = self._generate_trials_server(population, bounds_list)
+                trial_time = time.time() - trial_start
                 
                 # 服务器级并行评估
                 evaluation_start = time.time()
@@ -258,6 +305,7 @@ class ServerOptimizedDE:
                 evaluation_time = time.time() - evaluation_start
                 
                 # 选择操作
+                selection_start = time.time()
                 for i in range(self.population_size):
                     if trial_fitness[i] > fitness[i]:
                         population[i] = trials[i]
@@ -266,11 +314,12 @@ class ServerOptimizedDE:
                         if trial_fitness[i] > best_fitness:
                             best_fitness = trial_fitness[i]
                             best_individual = trials[i].copy()
+                selection_time = time.time() - selection_start
                 
                 generation_time = time.time() - generation_start
                 
                 # 性能统计
-                self._update_performance_stats(generation_time, evaluation_time)
+                self._update_performance_stats(generation_time, evaluation_time, trial_time, selection_time)
                 
                 # 输出进度
                 if generation % 10 == 0 or generation < 10:
@@ -287,6 +336,9 @@ class ServerOptimizedDE:
         except KeyboardInterrupt:
             logger.info("收到中断信号，正在优雅退出...")
             self._save_final_results(generation, best_fitness, best_individual)
+        finally:
+            # 清理资源
+            self._cleanup_persistent_pool()
         
         # 最终结果
         logger.info("="*80)
@@ -345,20 +397,37 @@ class ServerOptimizedDE:
         # 准备每个个体的数据
         individual_data = [(population[i], bounds_list, i) for i in range(self.population_size)]
         
-        # 使用所有可用核心并行评估
-        with ProcessPoolExecutor(**self.process_pool_config) as executor:
+        # 使用持久化进程池或临时进程池
+        executor_to_use = self.executor if self.server_config.use_persistent_pool else None
+        
+        if executor_to_use is None:
+            executor_to_use = ProcessPoolExecutor(**self.process_pool_config)
+            should_close = True
+        else:
+            should_close = False
+        
+        try:
             # 提交所有任务
+            submit_start = time.time()
             future_to_idx = {
-                executor.submit(evaluate_individual_server, data): data[2] 
+                executor_to_use.submit(evaluate_individual_server, data): data[2] 
                 for data in individual_data
             }
+            submit_time = time.time() - submit_start
             
             # 收集结果
+            collect_start = time.time()
             completed = 0
+            individual_times = []
+            
             for future in as_completed(future_to_idx, timeout=self.server_config.process_timeout):
                 idx = future_to_idx[future]
                 try:
+                    individual_start = time.time()
                     result = future.result()
+                    individual_time = time.time() - individual_start
+                    individual_times.append(individual_time)
+                    
                     fitness[idx] = result
                     completed += 1
                     
@@ -369,18 +438,36 @@ class ServerOptimizedDE:
                 except Exception as e:
                     logger.error(f"个体{idx}评估失败: {e}")
                     fitness[idx] = -1000.0
+            
+            collect_time = time.time() - collect_start
+            
+            # 记录详细的性能统计
+            self.performance_stats['process_overhead'].append(submit_time)
+            self.performance_stats['sync_overhead'].append(collect_time)
+            if individual_times:
+                self.performance_stats['individual_times'].append(np.mean(individual_times))
+        
+        finally:
+            if should_close:
+                executor_to_use.shutdown(wait=True)
         
         return fitness
 
-    def _update_performance_stats(self, generation_time: float, evaluation_time: float):
+    def _update_performance_stats(self, generation_time: float, evaluation_time: float, 
+                                 trial_time: float, selection_time: float):
         """更新性能统计"""
         self.performance_stats['generation_times'].append(generation_time)
         self.performance_stats['evaluation_times'].append(evaluation_time)
         
         # 并行效率 = 实际加速比 / 理论加速比
-        theoretical_time = evaluation_time * self.n_processes  # 串行时间估计
-        actual_speedup = theoretical_time / evaluation_time if evaluation_time > 0 else 0
-        parallel_efficiency = actual_speedup / self.n_processes if self.n_processes > 0 else 0
+        if len(self.performance_stats['individual_times']) > 0:
+            avg_individual_time = self.performance_stats['individual_times'][-1]
+            theoretical_time = avg_individual_time * self.population_size
+            actual_speedup = theoretical_time / evaluation_time if evaluation_time > 0 else 0
+            parallel_efficiency = actual_speedup / self.n_processes if self.n_processes > 0 else 0
+        else:
+            parallel_efficiency = 0
+            
         self.performance_stats['parallel_efficiency'].append(parallel_efficiency)
         
         # 内存使用
@@ -398,6 +485,14 @@ class ServerOptimizedDE:
               f"总时间: {generation_time:6.2f}s | 评估: {evaluation_time:6.2f}s")
         print(f"         | 每个体: {avg_per_individual:5.1f}ms | "
               f"并行效率: {parallel_efficiency:5.1f}% | 内存: {memory_usage:4.1f}%")
+        
+        # 显示详细的性能分解
+        if (len(self.performance_stats['process_overhead']) > 0 and 
+            len(self.performance_stats['sync_overhead']) > 0):
+            process_overhead = self.performance_stats['process_overhead'][-1] * 1000
+            sync_overhead = self.performance_stats['sync_overhead'][-1] * 1000
+            print(f"         | 提交开销: {process_overhead:4.1f}ms | "
+                  f"同步开销: {sync_overhead:4.1f}ms")
 
     def _print_performance_summary(self):
         """打印性能总结"""
@@ -417,6 +512,13 @@ class ServerOptimizedDE:
         print(f"  平均并行效率: {avg_efficiency:.1f}%")
         print(f"  平均内存使用: {avg_memory:.1f}%")
         print(f"  使用核心数: {self.n_processes}")
+        
+        if self.performance_stats['process_overhead']:
+            avg_process_overhead = np.mean(self.performance_stats['process_overhead']) * 1000
+            avg_sync_overhead = np.mean(self.performance_stats['sync_overhead']) * 1000
+            print(f"  平均提交开销: {avg_process_overhead:.1f}ms")
+            print(f"  平均同步开销: {avg_sync_overhead:.1f}ms")
+        
         print("="*80)
 
     def _setup_signal_handlers(self):
@@ -489,7 +591,8 @@ def main():
         max_cores=80,
         memory_limit_gb=32,
         checkpoint_interval=50,
-        checkpoint_dir="./server_checkpoints"
+        checkpoint_dir="./server_checkpoints",
+        use_persistent_pool=True  # 启用持久化进程池
     )
     
     # 创建优化器
@@ -502,21 +605,17 @@ def main():
         checkpoint_name="problem4_server_80core"
     )
     
-    # 检查是否有检查点可以恢复
-    checkpoint_dir = Path(server_config.checkpoint_dir)
-    if checkpoint_dir.exists():
-        checkpoints = list(checkpoint_dir.glob("problem4_server_80core_gen_*.pkl"))
-        if checkpoints:
-            latest_checkpoint = max(checkpoints, key=lambda x: int(x.stem.split('_')[-1]))
-            print(f"发现检查点: {latest_checkpoint}")
-            resume = input("是否从检查点恢复？(y/n): ").lower().strip()
-            if resume == 'y':
-                result = optimizer.optimize(resume_from=str(latest_checkpoint))
-            else:
-                result = optimizer.optimize()
+    # 智能检查点恢复
+    latest_checkpoint = optimizer.find_latest_checkpoint()
+    if latest_checkpoint:
+        print(f"发现最新检查点: {latest_checkpoint}")
+        resume = input("是否从检查点恢复？(y/n): ").lower().strip()
+        if resume == 'y':
+            result = optimizer.optimize(resume_from=latest_checkpoint)
         else:
             result = optimizer.optimize()
     else:
+        print("未发现检查点文件，从头开始优化")
         result = optimizer.optimize()
     
     print(f"\n🎯 服务器优化完成!")

@@ -48,6 +48,20 @@ HAS_MULTIPLE_MASKING = True
 plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'DejaVu Sans']
 plt.rcParams['axes.unicode_minus'] = False
 
+# 抑制libpng警告和matplotlib警告
+import warnings
+import os
+import matplotlib
+# 设置环境变量抑制libpng警告
+os.environ['PYTHONWARNINGS'] = 'ignore::UserWarning'
+# 抑制所有相关警告
+warnings.filterwarnings('ignore', category=UserWarning)
+warnings.filterwarnings('ignore', category=RuntimeWarning)
+warnings.filterwarnings('ignore', message='.*libpng warning.*')
+warnings.filterwarnings('ignore', message='.*iCCP.*')
+# 设置matplotlib后端
+matplotlib.rcParams['figure.max_open_warning'] = 0
+
 # 全局缓存，用于Multiple模式的性能优化
 _multiple_cache = {}
 _cache_lock = threading.Lock()
@@ -228,12 +242,12 @@ def calculate_bounds():
     bounds = {
         'v_FY1': (70.0, 140.0),              # 无人机速度
         'theta_FY1': (0.0, 360.0),           # 无人机方向
-        'smoke_a_deploy_time': (0.1, t_max - 5.0),    # 烟幕弹A投放时间
-        'smoke_a_explode_delay': (0.1, 10.0),         # 烟幕弹A引信延时
-        'smoke_b_deploy_delay': (0.1, 10.0),          # 烟幕弹B投放延时（相对A）
-        'smoke_b_explode_delay': (0.1, 10.0),         # 烟幕弹B引信延时
-        'smoke_c_deploy_delay': (0.1, 10.0),          # 烟幕弹C投放延时（相对B）
-        'smoke_c_explode_delay': (0.1, 10.0)          # 烟幕弹C引信延时
+        'smoke_a_deploy_time': (0.01, 10),    # 烟幕弹A投放时间
+        'smoke_a_explode_delay': (0.01, 10.0),         # 烟幕弹A引信延时
+        'smoke_b_deploy_delay': (1, 10.0),          # 烟幕弹B投放延时（相对A）
+        'smoke_b_explode_delay': (0.01, 10.0),         # 烟幕弹B引信延时
+        'smoke_c_deploy_delay': (1, 10.0),          # 烟幕弹C投放延时（相对B）
+        'smoke_c_explode_delay': (0.01, 10.0)          # 烟幕弹C引信延时
     }
     
     return bounds
@@ -341,6 +355,14 @@ class DifferentialEvolution_Problem3:
         # 中断处理标志
         self.interrupted = False
     
+    def _ensure_bounds(self, position: np.ndarray) -> np.ndarray:
+        """确保位置在边界内（统一的边界处理函数）"""
+        bounded_position = position.copy()
+        for i in range(self.n_dims):
+            min_val, max_val = self.bounds_list[i]
+            bounded_position[i] = np.clip(bounded_position[i], min_val, max_val)
+        return bounded_position
+    
     def _initialize_population(self):
         """初始化种群（支持多子种群）"""
         print(f"初始化种群，大小: {self.population_size}")
@@ -405,15 +427,17 @@ class DifferentialEvolution_Problem3:
                 position[1] = np.random.uniform(0, 360)    # 随机方向
                 position[2] = np.random.uniform(0.1, 5.0)  # 随机投放时间
                 position[3] = np.random.uniform(0.1, 3.0)  # 较短延时
-                position[4] = np.random.uniform(0.1, 2.0)  # 短间隔
+                position[4] = np.random.uniform(1.0, 2.0)  # 短间隔（修正：遵守下界1.0）
                 position[5] = np.random.uniform(0.1, 3.0)  # 较短延时
-                position[6] = np.random.uniform(0.1, 2.0)  # 短间隔
+                position[6] = np.random.uniform(1.0, 2.0)  # 短间隔（修正：遵守下界1.0）
                 position[7] = np.random.uniform(0.1, 3.0)  # 较短延时
         else:
             # 单种群：完全随机初始化
             for i, (min_val, max_val) in enumerate(self.bounds_list):
                 position[i] = np.random.uniform(min_val, max_val)
         
+        # 确保生成的位置在边界内
+        position = self._ensure_bounds(position)
         return position
     
     def _evaluate_population(self):
@@ -563,9 +587,7 @@ class DifferentialEvolution_Problem3:
                      F * (self.population[r2].position - self.population[r3].position))
         
         # 边界处理
-        for i in range(self.n_dims):
-            min_val, max_val = self.bounds_list[i]
-            mutant[i] = np.clip(mutant[i], min_val, max_val)
+        mutant = self._ensure_bounds(mutant)
         
         return mutant
     
@@ -589,6 +611,9 @@ class DifferentialEvolution_Problem3:
                 L += 1
                 if L >= self.n_dims or np.random.random() >= CR:
                     break
+        
+        # 交叉后的边界处理
+        trial = self._ensure_bounds(trial)
         
         return trial
     
